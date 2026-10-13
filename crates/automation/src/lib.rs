@@ -15,6 +15,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 mod a11y;
+mod ai;
 mod batch;
 mod comments;
 mod content;
@@ -118,6 +119,7 @@ pub struct Automation {
     renderers: HashMap<DocId, (Arc<Vec<u8>>, PageRenderer)>,
     /// Extracted page text, under one memory budget across all open documents.
     texts: TextCache,
+    ai_provider: ai::ProviderConfig,
 }
 
 impl Default for Automation {
@@ -128,7 +130,14 @@ impl Default for Automation {
 
 impl Automation {
     pub fn new() -> Self {
-        Self { session: Session::new(), root: None, roots: None, renderers: HashMap::new(), texts: TextCache::default() }
+        Self {
+            session: Session::new(),
+            root: None,
+            roots: None,
+            renderers: HashMap::new(),
+            texts: TextCache::default(),
+            ai_provider: ai::ProviderConfig::default(),
+        }
     }
 
     /// Confine every path the tools read or write to `root` (relative paths resolve inside it).
@@ -849,6 +858,11 @@ impl Automation {
             "comments_summarize" => self.comments_summarize(&a)?,
             "comment_edit" => self.comment_edit(&a)?,
             "comment_delete" => self.comment_delete(&a)?,
+            "ai_provider" => self.ai_provider(&a)?,
+            "ai_summarize" => self.ai_summarize(&a)?,
+            "ai_ask" => self.ai_ask(&a)?,
+            "ai_suggest_redactions" => self.ai_suggest_redactions(&a)?,
+            "ai_suggest_alt_text" => self.ai_suggest_alt_text(&a)?,
             other => return Err(ToolError::UnknownTool(other.into())),
         };
         Ok(vec![Content::Json(out)])

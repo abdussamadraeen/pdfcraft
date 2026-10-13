@@ -6563,3 +6563,203 @@ fn a_root_less_write_output_is_atomic_too() {
     assert!(matches!(&e, ToolError::Failed(m) if m.contains("is a folder")), "{e:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn ai_test_pdf(pages: &[&str]) -> Vec<u8> {
+    let mut objs: Vec<Vec<u8>> = vec![b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()];
+    let kids: Vec<String> = (0..pages.len()).map(|i| format!("{} 0 R", 4 + 2 * i)).collect();
+    objs.push(format!("<< /Type /Pages /Kids [{}] /Count {} /MediaBox [0 0 612 792] >>", kids.join(" "), pages.len()).into_bytes());
+    objs.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
+    for (i, &text) in pages.iter().enumerate() {
+        objs.push(format!("<< /Type /Page /Parent 2 0 R /Contents {} 0 R /Resources << /Font << /F1 3 0 R >> >> >>", 5 + 2 * i).into_bytes());
+        let body = format!("BT /F1 12 Tf 50 700 Td ({text}) Tj ET");
+        objs.push(format!("<< /Length {} >>\nstream\n{body}\nendstream", body.len()).into_bytes());
+    }
+    let mut out = b"%PDF-1.7\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+        out.extend_from_slice(o);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).as_bytes());
+    for o in offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).as_bytes());
+    out
+}
+
+#[test]
+fn ai_provider_management_and_toggle() {
+    let dir = workdir("ai-provider");
+    let mut a = auto(&dir);
+
+    // 1. Off by default
+    let cfg = ok(&mut a, "ai_provider", json!({}));
+    assert_eq!(cfg["enabled"], false);
+    assert_eq!(cfg["mode"], "builtin");
+
+    // 2. Disabled call returns clear opt-in error
+    std::fs::write(dir.join("doc.pdf"), fixture(1)).unwrap();
+    let doc = ok(&mut a, "doc_open", json!({"path": "doc.pdf"}))["doc"].as_u64().unwrap();
+    let e = err(&mut a, "ai_summarize", json!({"doc": doc}));
+    assert!(e.to_string().contains("AI provider is disabled by default"));
+
+    // 3. Enable provider
+    let updated = ok(
+        &mut a,
+        "ai_provider",
+        json!({
+            "enabled": true,
+            "mode": "endpoint",
+            "endpoint": "http://localhost:11434",
+            "model": "llama3"
+        }),
+    );
+    assert_eq!(updated["enabled"], true);
+    assert_eq!(updated["mode"], "endpoint");
+    assert_eq!(updated["endpoint"], "http://localhost:11434");
+    assert_eq!(updated["model"], "llama3");
+
+    // 4. Reset to builtin mode
+    let builtin = ok(&mut a, "ai_provider", json!({"mode": "builtin"}));
+    assert_eq!(builtin["mode"], "builtin");
+}
+
+#[test]
+fn ai_summarize_generates_points_and_citations() {
+    let dir = workdir("ai-summarize");
+    let pdf = ai_test_pdf(&[
+        "Artificial intelligence is transforming document workflows. Machine learning accelerates parsing and semantic indexing.",
+        "Sovereign local models safeguard user data privacy. Offline extraction provides rapid responses without external latency.",
+    ]);
+    std::fs::write(dir.join("ai_doc.pdf"), pdf).unwrap();
+
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({"path": "ai_doc.pdf"}))["doc"].as_u64().unwrap();
+
+    let res = ok(
+        &mut a,
+        "ai_summarize",
+        json!({
+            "doc": doc,
+            "enabled": true,
+            "max_points": 3
+        }),
+    );
+
+    assert!(res["word_count"].as_u64().unwrap() > 10);
+    assert!(res["reading_time_minutes"].as_u64().unwrap() >= 1);
+    assert_eq!(res["page_count"], 2);
+
+    let points = res["key_points"].as_array().unwrap();
+    assert!(!points.is_empty());
+    for p in points {
+        let citation = p["citation"].as_str().unwrap();
+        assert!(citation.starts_with("[Page "));
+        assert!(p["text"].as_str().unwrap().len() > 5);
+    }
+
+    let citations = res["citations"].as_array().unwrap();
+    assert!(!citations.is_empty());
+}
+
+#[test]
+fn ai_ask_answers_with_page_citations() {
+    let dir = workdir("ai-ask");
+    let pdf = ai_test_pdf(&[
+        "Acrobat Pro offers basic cloud-based summarization features.",
+        "PdfCraft implements a sovereign local AI provider for complete offline privacy and safety.",
+    ]);
+    std::fs::write(dir.join("ask_doc.pdf"), pdf).unwrap();
+
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({"path": "ask_doc.pdf"}))["doc"].as_u64().unwrap();
+
+    // Query matching page 2
+    let res = ok(
+        &mut a,
+        "ai_ask",
+        json!({
+            "doc": doc,
+            "question": "What does PdfCraft implement for privacy?",
+            "enabled": true
+        }),
+    );
+
+    assert_eq!(res["confidence"], "high");
+    let answer = res["answer"].as_str().unwrap();
+    assert!(answer.contains("Page 2") || answer.contains("sovereign local AI"));
+
+    let citations = res["citations"].as_array().unwrap();
+    assert!(!citations.is_empty());
+    assert_eq!(citations[0]["page"], 2);
+    assert!(citations[0]["excerpt"].as_str().unwrap().contains("PdfCraft implements a sovereign local AI"));
+
+    // Query with no match
+    let unanswerable = ok(
+        &mut a,
+        "ai_ask",
+        json!({
+            "doc": doc,
+            "question": "What is the capital of Neptune?",
+            "enabled": true
+        }),
+    );
+    assert_eq!(unanswerable["confidence"], "low");
+}
+
+#[test]
+fn ai_suggest_redactions_detects_sensitive_data() {
+    let dir = workdir("ai-redact");
+    let pdf = ai_test_pdf(&[
+        "Contact security at admin@example.com or phone 555-123-4567. Employee SSN is 123-45-6789 with live key sk_live_1234567890abcdef.",
+    ]);
+    std::fs::write(dir.join("pii.pdf"), pdf).unwrap();
+
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({"path": "pii.pdf"}))["doc"].as_u64().unwrap();
+
+    let res = ok(
+        &mut a,
+        "ai_suggest_redactions",
+        json!({
+            "doc": doc,
+            "enabled": true,
+            "mark": true
+        }),
+    );
+
+    let count = res["count"].as_u64().unwrap();
+    assert!(count >= 3, "should find email, phone, ssn, and api key; found {count}");
+    assert_eq!(res["marked"], true);
+    assert!(res["marks_applied"].as_u64().unwrap() >= 3);
+
+    let suggestions = res["suggestions"].as_array().unwrap();
+    let cats: Vec<&str> = suggestions.iter().map(|s| s["category"].as_str().unwrap()).collect();
+    assert!(cats.contains(&"email"));
+    assert!(cats.contains(&"phone") || cats.contains(&"ssn"));
+}
+
+#[test]
+fn ai_suggest_alt_text_for_figures_and_images() {
+    let dir = workdir("ai-alt-text");
+    let pdf = ai_test_pdf(&["Figure 1: High-level system architecture overview diagram."]);
+    std::fs::write(dir.join("alt_doc.pdf"), pdf).unwrap();
+
+    let mut a = auto(&dir);
+    let doc = ok(&mut a, "doc_open", json!({"path": "alt_doc.pdf"}))["doc"].as_u64().unwrap();
+
+    let res = ok(
+        &mut a,
+        "ai_suggest_alt_text",
+        json!({
+            "doc": doc,
+            "enabled": true
+        }),
+    );
+
+    assert!(res["count"].as_u64().is_some());
+}

@@ -363,12 +363,9 @@ update the numbers.
   model.
 - **Estimate:** 20–35 h. **Doc:** [pdf-spec-parity.md](pdf-spec-parity.md).
 
-### 23. Local AI provider
+### 23. Local AI provider (closed)
 
-- **Missing:** the opt-in provider interface (local model or the user's own endpoint) and the
-  features on it: summarize, ask with page citations, alternate-text and redaction suggestions.
-  Acrobat's AI Assistant is a cloud service and out of scope.
-- **Estimate:** 20–40 h. **Doc:** [target-app-parity.md](target-app-parity.md).
+- **Closed (2026-10-13):** implemented sovereign local AI subsystem (`crates/automation/src/ai.rs`) providing `ai_provider`, `ai_summarize`, `ai_ask`, `ai_suggest_redactions`, and `ai_suggest_alt_text`. Off by default for privacy; supports sovereign offline BM25 semantic retrieval, extractive document summarization with page citations, sensitive content detection, and automated alternate text generation, with opt-in local HTTP endpoint (Ollama) support.
 
 ### 24. Checklist not diffed against Acrobat's own menus
 
@@ -385,6 +382,7 @@ update the numbers.
 | 2026-10-15 | minor | Gap 12: the text oracle scores reading order as well as word F1, which is a bag of words and cannot see order; the first measurement separated 18 improvements from 6 regressions in a change F1 called unchanged on 26 of 29 files. Estimates unchanged. |
 | 2026-10-14 | minor | M1: raw-deflate fallback preserves decoding-limit errors in strict and tolerant decoding; synthetic filter and COS stream regressions. Estimates unchanged. |
 | 2026-10-15 | patch | Gap 24: record localization and installers as partial (unusable Chinese, Telugu and Arabic; unsigned Linux packages) |
+| 2026-10-13 | minor | Closed gap 23: sovereign local AI subsystem in crates/automation (`ai_provider`, `ai_summarize`, `ai_ask`, `ai_suggest_redactions`, `ai_suggest_alt_text`) with page citations, PII detection and alt-text suggestions; off by default; opt-in local endpoints supported. |
 | 2026-10-13 | minor | Gap 6: Organize Pages selects and reveals the current page on open, including after an earlier grid selection elsewhere (#1910). Estimates unchanged. |
 | 2026-10-12 | minor | Gap 6: rubber stamps, explicit image rectangles and PDF-page stamps read upright on rotated pages (#1398). Estimates unchanged. |
 | 2026-10-12 | minor | #1316: replacing a line or paragraph keeps a neighbouring line whose glyph box overlaps. Gap 3 remains. Estimates unchanged. |

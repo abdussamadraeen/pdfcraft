@@ -5773,11 +5773,11 @@ title = "Suggest sensitive content to redact via an AI provider"
 area = "G"
 tier = "P2"
 milestone = "M13"
-status = "planned"
+status = "shipped"
 commands = []
-tools = []
-evidence = []
-notes = "local or user-provided model; off by default"
+tools = ["ai_suggest_redactions"]
+evidence = ["crates/automation/tests/automation.rs::ai_suggest_redactions_detects_sensitive_data"]
+notes = "Detects PII, SSNs, credit cards, emails, phone numbers, API keys, credentials, IP addresses with exact view coordinates; optionally applies marks."
 
 [[feature]]
 id = "protect.remove-hidden-information"
@@ -9017,11 +9017,11 @@ title = "Suggest alternate text via an AI provider"
 area = "M"
 tier = "P2"
 milestone = "M13"
-status = "planned"
+status = "shipped"
 commands = []
-tools = []
-evidence = []
-notes = "optional provider; off by default"
+tools = ["ai_suggest_alt_text"]
+evidence = ["crates/automation/tests/automation.rs::ai_suggest_alt_text_for_figures_and_images"]
+notes = "Synthesizes descriptive alternate text for figures and images based on page context, captions, surrounding headings and layout dimensions."
 
 [[feature]]
 id = "a11y.set-language"
@@ -9525,11 +9525,11 @@ title = "AI provider interface (local model or own endpoint), off by default"
 area = "N"
 tier = "P2"
 milestone = "M13"
-status = "planned"
+status = "shipped"
 commands = []
-tools = []
-evidence = []
-notes = ""
+tools = ["ai_provider"]
+evidence = ["crates/automation/tests/automation.rs::ai_provider_management_and_toggle"]
+notes = "Opt-in AI provider interface: off by default; supports sovereign local engine or user-configured local HTTP endpoint."
 
 [[feature]]
 id = "misc.ai-summary"
@@ -9537,11 +9537,11 @@ title = "Summarize a document"
 area = "N"
 tier = "P2"
 milestone = "M13"
-status = "planned"
+status = "shipped"
 commands = []
-tools = []
-evidence = []
-notes = ""
+tools = ["ai_summarize"]
+evidence = ["crates/automation/tests/automation.rs::ai_summarize_generates_points_and_citations"]
+notes = "Extractive summary, key points, reading time, word count and explicit [Page n] citations across pages."
 
 [[feature]]
 id = "misc.ai-ask"
@@ -9549,11 +9549,11 @@ title = "Ask questions with citations to pages"
 area = "N"
 tier = "P2"
 milestone = "M13"
-status = "planned"
+status = "shipped"
 commands = []
-tools = []
-evidence = []
-notes = ""
+tools = ["ai_ask"]
+evidence = ["crates/automation/tests/automation.rs::ai_ask_answers_with_page_citations"]
+notes = "Q&A search over document text using BM25 relevance ranking, contextual answer synthesis, confidence scores and page citations."
 
 [[feature]]
 id = "misc.ai-conversational-edit"
