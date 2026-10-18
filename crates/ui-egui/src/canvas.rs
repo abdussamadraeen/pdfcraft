@@ -2710,6 +2710,13 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     {
         view.pending_edit = Some(edit);
     }
+    if view.line_editor.is_some()
+        && (tool == QuickTool::EditText || tool == QuickTool::AddText)
+        && (!app.left_open || app.left != crate::LeftPanel::Tool("edit"))
+    {
+        app.left = crate::LeftPanel::Tool("edit");
+        app.left_open = true;
+    }
     view.objects.prepare(doc, tool == QuickTool::EditText && can_modify, ui.ctx());
     view.text_background.prepare(ui.ctx(), doc, view.line_editor.as_ref(), view.content.draft.as_ref(), scale);
     let added = if editing_content { doc.added().to_vec() } else { Vec::new() };
@@ -4564,6 +4571,8 @@ fn quick_bar(app: &mut PdfCraftApp, area: Rect, ui: &mut egui::Ui) {
                                 app.put_down_edit_text();
                             } else {
                                 app.quick_tool = QuickTool::EditText;
+                                app.left = crate::LeftPanel::Tool("edit");
+                                app.left_open = true;
                             }
                         }
                     }

@@ -2207,6 +2207,20 @@ fn paragraph_spacing_without_line_spacing_preserves_source_leading() {
 }
 
 #[test]
+fn synthetic_space_between_separate_runs_preserves_word_boundary() {
+    // Two runs on the same line with a gap between them (like (sh) and (D2))
+    let doc = text_page("BT /F1 12 Tf 1 0 0 1 72 700 Tm (Fail a link) Tj 1 0 0 1 140 700 Tm (sh) Tj 1 0 0 1 160 700 Tm (D2) Tj ET");
+    let blocks = text::text_blocks(&doc, 0).unwrap();
+    assert_eq!(blocks.len(), 1, "runs on the same baseline should group into one block");
+    let block = &blocks[0];
+    assert!(block.editor_text.contains("sh D2"), "editor_text should include space between separate runs: '{}'", block.editor_text);
+    // Verify that every byte in editor_text belongs to a valid span range
+    for (i, _) in block.editor_text.char_indices() {
+        assert!(block.spans.iter().any(|(r, _)| r.contains(&i)), "char at index {i} in '{}' must belong to a span", block.editor_text);
+    }
+}
+
+#[test]
 fn a_line_drawn_twice_is_replaced_everywhere() {
     // Fake bold: a line drawn twice at the same spot (each copy its own text object). The two
     // copies group apart, but editing one replaces both — a surviving copy would show the old

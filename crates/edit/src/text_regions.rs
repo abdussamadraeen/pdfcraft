@@ -142,10 +142,13 @@ fn group_layout(lines: &[TextLine], mixed: bool) -> Vec<TextBlock> {
             if let Some(prev) = block.lines.last().filter(|i| row.contains(i)).and_then(|i| lines.get(*i))
                 && !row_text.ends_with(char::is_whitespace)
                 && !line.text.starts_with(char::is_whitespace)
-                && line.frame_rect()[0] - prev.frame_rect()[2] > line.size * 0.12
+                && line.frame_rect()[0] - prev.frame_rect()[2] > line.size * 0.08
             {
                 row_text.push(' ');
                 block.editor_text.push(' ');
+                if let Some((range, _)) = block.spans.last_mut() {
+                    range.end = block.editor_text.len();
+                }
             }
             let start = block.editor_text.len();
             block.editor_text.push_str(&line.text);
@@ -713,7 +716,7 @@ pub(super) fn rewrite_styled_block(
         let align = style.align.unwrap_or(if centered { crate::added::Align::Center } else { crate::added::Align::Left });
         let original_rect = block.rows.get(row_index).and_then(|row| row_rect(row, lines)).unwrap_or(block.rect);
         let left = if style.width.is_none() && style.align.is_none() { original_rect[0] } else { block.rect[0] };
-        let available = if style.width.is_none() && style.align.is_none() { original_rect[2] - original_rect[0] } else { width };
+        let available = if style.width.is_none() && style.align.is_none() { (original_rect[2] - original_rect[0]).max(w) } else { width };
         let mut x = left
             + match align {
                 crate::added::Align::Center => (available - w) / 2.0,

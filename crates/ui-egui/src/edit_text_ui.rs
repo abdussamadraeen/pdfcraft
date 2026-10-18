@@ -1060,8 +1060,11 @@ pub(crate) fn page_input(
                     offset: [to[0] - from[0], to[1] - from[1]],
                 }
             };
-            if preview != b {
+            let distance = (p - d.start).length();
+            if preview != b && distance >= 4.0 {
                 view.pending_edit = Some(edit);
+            } else if d.grip == Grip::Move {
+                open_editor(ui, xf, doc, lines, &boxes, page, d.block, view);
             }
         }
         return true;
@@ -1081,7 +1084,7 @@ pub(crate) fn page_input(
     let hover_pos = ui.input(|i| i.pointer.hover_pos()).filter(|p| xf.rect.contains(*p));
     let hit_grip = hover_pos.and_then(|p| grab_at(&boxes, p, upright));
 
-    if resp.clicked() {
+    if resp.clicked() || resp.double_clicked() {
         view.image_selection = None;
         if let Some(open) = view.line_editor.as_ref() {
             if hit_grip.is_some_and(|(hit, _)| open.page == page && open.block == hit) {
@@ -1116,12 +1119,10 @@ pub(crate) fn page_input(
     if upright && active.is_none() {
         draw_handles(boxes[hit]);
     }
-    // A closed paragraph moves when dragged (the four-way arrow says so; a click still opens it
-    // for typing); an edge rewraps it. The open one takes the text cursor.
+    // Hovering inside an editable text box shows the I-beam text cursor so users immediately
+    // see that text is editable with a single click. Edge handles show the horizontal resize cursor.
     ui.ctx().set_cursor_icon(if on_edge {
         egui::CursorIcon::ResizeHorizontal
-    } else if active.is_none() {
-        egui::CursorIcon::Move
     } else {
         egui::CursorIcon::Text
     });
@@ -1215,7 +1216,12 @@ fn editor_job(ui: &egui::Ui, ed: &LineEditor, text: &str, scale: f32, width: f32
             }
             let native_width = ui.fonts_mut(|f| f.layout_no_wrap(line.text.clone(), font.clone(), Color32::BLACK).size().x);
             let target_width = ((line.rect[2] - line.rect[0]) * look.size / line.size.max(0.01)) as f32 * scale;
-            let spacing = if original_face { (target_width - native_width) / line.text.chars().count().saturating_sub(1).max(1) as f32 } else { 0.0 };
+            let spacing = if original_face && text == ed.original {
+                let raw = (target_width - native_width) / line.text.chars().count().saturating_sub(1).max(1) as f32;
+                raw.clamp(-0.5, 4.0)
+            } else {
+                0.0
+            };
             job.append(
                 text.get(range).unwrap_or_default(),
                 0.0,
@@ -1356,12 +1362,19 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
             // source width, and the visible frame grows/shrinks vertically with their rows.
             // An OCR phrase (several stretched words on one scanned line) also grows rightwards.
             let single_run = ed.source.as_ref().is_some_and(|(block, _)| block.rows.len() == 1 || block.invisible);
-            let width = if !ed.multiline && single_run && !ed.text.contains('\n') && ed.has_changes() {
+            let width = if !ed.multiline && single_run && !ed.text.contains('\n') {
                 let job = editor_job(ui, ed, &ed.text, scale, f32::INFINITY);
                 let natural = ui.fonts_mut(|f| f.layout_job(job)).size().x;
-                natural.max(ed.size * 0.4).min((xf.rect.right() - ed.rect.left() - 36.0 * scale).max(ed.rect.width()))
+                natural.max(ed.size * 0.4).max(ed.rect.width()).min((xf.rect.right() - ed.rect.left() - 20.0 * scale).max(ed.rect.width()))
             } else {
-                ed.rect.width().max(1.0)
+                let job = editor_job(ui, ed, &ed.text, scale, f32::INFINITY);
+                let natural = ui.fonts_mut(|f| f.layout_job(job)).size().x;
+                let max_margin = (xf.rect.right() - ed.rect.left() - 20.0 * scale).max(ed.rect.width());
+                if ed.has_changes() && natural > ed.rect.width() {
+                    natural.min(max_margin)
+                } else {
+                    ed.rect.width().max(1.0)
+                }
             };
             ui.set_width(width);
             let measured = editor_galley(ui, ed, &ed.text, scale, width);

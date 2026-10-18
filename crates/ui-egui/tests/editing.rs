@@ -4781,3 +4781,26 @@ fn leaving_organize_goes_back_to_the_workspace_panel() {
     h.run_steps(3);
     assert_eq!(h.state().left, LeftPanel::AllTools);
 }
+
+/// A micro-drag (accidental pointer jitter during click) opens the inline editor instead of
+/// dropping the interaction, and automatically reveals the format panel.
+#[test]
+fn micro_drag_opens_editor_and_reveals_edit_panel() {
+    let mut h = harness(1, |_| {});
+    assert!(h.state_mut().execute("edit.edit_text"));
+    h.run_steps(2);
+    let r = h.state().views[0].page_screen_rect(0).expect("on screen");
+    let at = egui::pos2(r.left() + 40.0 / 200.0 * r.width(), r.top() + (300.0 - 158.0) / 300.0 * r.height());
+    h.hover_at(at);
+    h.run_steps(1);
+    // Move pointer slightly during click (1.5 px jitter)
+    let jitter = at + egui::vec2(1.5, 1.5);
+    h.drag_at(at);
+    h.run_steps(1);
+    h.drop_at(jitter);
+    h.run_steps(3);
+    assert!(h.state().views[0].line_editor.is_some(), "editor should open despite minor mouse movement");
+    assert_eq!(h.state().left, pdfcraft_ui_egui::LeftPanel::Tool("edit"), "edit panel should be revealed");
+    assert!(h.state().left_open, "left panel should be open");
+}
+
