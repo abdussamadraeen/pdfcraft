@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use pdfcraft_content::{Matrix, Op, Pieces, parse, serialize_ops};
-use pdfcraft_cos::{Dict, Document, Object, PdfString, Stream};
+use pdfcraft_cos::{Dict, Document, Object, ObjRef, PdfString, Stream};
 use pdfcraft_fonts::pdf::Metrics;
 use pdfcraft_fonts::{CraftFont, GlyphError, japanese_glyph_from};
 
@@ -2010,6 +2010,22 @@ pub(crate) fn rewrite_block_with_limit(
     rewrite_block_from(doc, page, lines, block, text, style, max_glyphs)
 }
 
+/// Resolve `/Resources` traversing the `/Parent` chain if inherited.
+pub(crate) fn inherited_page_resources(doc: &Document, page_ref: ObjRef) -> Dict {
+    let mut node = Some(page_ref);
+    for _ in 0..64 {
+        let Some(curr) = node else { break };
+        let Some(d) = doc.get(curr).as_dict().cloned() else { break };
+        if let Some(r) = d.get(b"Resources")
+            && let Some(res) = doc.resolve(r).as_dict()
+        {
+            return res.clone();
+        }
+        node = d.reference(b"Parent");
+    }
+    Dict::new()
+}
+
 /// [`rewrite_block_with_limit`] with the page's [`text_lines`], read from `doc` as it is now.
 fn rewrite_block_from(
     doc: &mut Document,
@@ -2025,7 +2041,7 @@ fn rewrite_block_from(
     let members: Vec<&TextLine> = b.lines.iter().map(|i| &lines[*i]).collect();
     let first = members.first().copied().ok_or_else(|| EditError::Invalid("the paragraph has no source runs".into()))?;
     let p = page_dict(doc, page)?;
-    let mut res = p.dict.get(b"Resources").map(|r| doc.resolve(r)).and_then(|r| r.as_dict().cloned()).unwrap_or_default();
+    let mut res = inherited_page_resources(doc, p.obj);
     let mut fonts_res = res.get(b"Font").map(|f| doc.resolve(f)).and_then(|f| f.as_dict().cloned()).unwrap_or_default();
     let registered_face = fonts_res.iter().any(|(name, _)| name.starts_with(b"PCFull"));
     // Hebrew is written back in drawing order (and with the Hebrew fallback face) by the

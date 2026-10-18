@@ -68,6 +68,33 @@ pub struct AiMessage {
     pub findings: Vec<FindingUi>,
     pub alt_suggestions: Vec<AltSuggestionUi>,
     pub key_points: Vec<(usize, String)>,
+    pub provider_tag: Option<String>,
+}
+
+impl AiMessage {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: AiRole::User,
+            content: content.into(),
+            citations: Vec::new(),
+            findings: Vec::new(),
+            alt_suggestions: Vec::new(),
+            key_points: Vec::new(),
+            provider_tag: None,
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>, provider_tag: Option<String>) -> Self {
+        Self {
+            role: AiRole::Assistant,
+            content: content.into(),
+            citations: Vec::new(),
+            findings: Vec::new(),
+            alt_suggestions: Vec::new(),
+            key_points: Vec::new(),
+            provider_tag,
+        }
+    }
 }
 
 /// High-level executive document metrics.
@@ -101,13 +128,16 @@ pub struct AiState {
     pub history: Vec<AiMessage>,
     pub input: String,
     pub is_busy: bool,
+    pub busy_label: String,
     pub provider_mode: ProviderMode,
     pub endpoint_url: String,
     pub model_name: String,
+    pub api_key: String,
     pub show_settings: bool,
     pub telemetry: Option<DocTelemetry>,
     pub last_doc_id: Option<pdfcraft_engine::DocId>,
     pub summary_length: SummaryLength,
+    pub pending_rx: Option<std::sync::mpsc::Receiver<Result<AiMessage, String>>>,
 }
 
 impl Default for AiState {
@@ -116,16 +146,20 @@ impl Default for AiState {
             history: Vec::new(),
             input: String::new(),
             is_busy: false,
+            busy_label: String::new(),
             provider_mode: ProviderMode::Builtin,
             endpoint_url: "http://localhost:11434".to_string(),
             model_name: "llama3.2".to_string(),
+            api_key: String::new(),
             show_settings: false,
             telemetry: None,
             last_doc_id: None,
             summary_length: SummaryLength::Balanced,
+            pending_rx: None,
         }
     }
 }
+
 
 /// Actions dispatched from the AI panel to the parent application.
 pub enum AiPanelAction {
@@ -208,83 +242,222 @@ impl AiState {
 
     /// Generate executive document summary.
     pub fn trigger_summary(&mut self, doc: &pdfcraft_engine::Document, view: &DocView) {
-        self.history.push(AiMessage {
-            role: AiRole::User,
-            content: "Summarize this document".to_string(),
-            citations: Vec::new(),
-            findings: Vec::new(),
-            alt_suggestions: Vec::new(),
-            key_points: Vec::new(),
-        });
+        if self.is_busy {
+            return;
+        }
+
+        self.history.push(AiMessage::user("Summarize this document"));
 
         let texts = extract_all_page_texts(doc, view);
         let sentences = collect_all_sentences(&texts);
-        let (summary_text, key_points_raw, total_words, reading_time) =
-            generate_summary_pure(&sentences, 5, self.summary_length.as_str());
+        let summary_length = self.summary_length;
 
-        self.telemetry = Some(DocTelemetry {
-            total_pages: doc.info.pages.len(),
-            total_words,
-            reading_time_minutes: reading_time,
-        });
+        if self.provider_mode == ProviderMode::Builtin {
+            let (summary_text, key_points_raw, total_words, reading_time) =
+                generate_summary_pure(&sentences, 5, summary_length.as_str());
 
-        let mut citations_set = std::collections::BTreeSet::new();
-        for (page, _) in &key_points_raw {
-            citations_set.insert(*page);
+            self.telemetry = Some(DocTelemetry {
+                total_pages: doc.info.pages.len(),
+                total_words,
+                reading_time_minutes: reading_time,
+            });
+
+            let mut citations_set = std::collections::BTreeSet::new();
+            for (page, _) in &key_points_raw {
+                citations_set.insert(*page);
+            }
+            let citations: Vec<CitationUi> = citations_set.into_iter().map(|p| CitationUi { page: p, score: None }).collect();
+
+            let mut msg = AiMessage::assistant(summary_text, Some("Offline Sovereign".to_string()));
+            msg.citations = citations;
+            msg.key_points = key_points_raw;
+            self.history.push(msg);
+        } else {
+            let mut doc_context = String::new();
+            for (p, text) in &texts {
+                doc_context.push_str(&format!("\n--- Page {} ---\n", p + 1));
+                doc_context.push_str(&text.plain_text());
+            }
+
+            let config = pdfcraft_automation::ai::ProviderConfig {
+                enabled: true,
+                mode: pdfcraft_automation::ai::ProviderMode::Endpoint,
+                endpoint: Some(self.endpoint_url.clone()),
+                model: Some(self.model_name.clone()),
+                api_key: if self.api_key.trim().is_empty() { None } else { Some(self.api_key.clone()) },
+            };
+
+            let provider_name = if self.endpoint_url.contains("googleapis.com") || self.endpoint_url.contains("gemini") {
+                format!("Google Gemini ({})", self.model_name)
+            } else if self.endpoint_url.contains("11434") {
+                format!("Ollama ({})", self.model_name)
+            } else if self.endpoint_url.contains("groq.com") {
+                format!("Groq Cloud ({})", self.model_name)
+            } else {
+                format!("AI Endpoint ({})", self.model_name)
+            };
+
+            self.is_busy = true;
+            self.busy_label = format!("Analyzing document with {provider_name}…");
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.pending_rx = Some(rx);
+
+            let length_str = summary_length.as_str().to_string();
+            let sentences_fallback = sentences.clone();
+            let provider_tag = provider_name.clone();
+
+            std::thread::spawn(move || {
+                let system_prompt = "You are an expert executive document analyst. Produce a comprehensive, professional Executive Summary of the provided PDF document.\n\
+Format your summary with clear Markdown headers:\n\
+### Executive Overview\n\
+### Key Highlights & Core Findings\n\
+### Action Items & Next Steps\n\
+### Critical Risks & Considerations\n\n\
+Whenever referencing facts or data, include exact page citation brackets like [Page 1], [Page 2].";
+
+                let user_prompt = format!("Please generate an executive summary (detail: {length_str}):\n{doc_context}");
+
+                let res = match pdfcraft_automation::ai::call_llm_endpoint(&config, Some(system_prompt), &user_prompt) {
+                    Ok(resp) => {
+                        let mut citations = Vec::new();
+                        for p in pdfcraft_automation::ai::extract_page_citations(&resp) {
+                            citations.push(CitationUi { page: p, score: None });
+                        }
+                        let mut msg = AiMessage::assistant(resp, Some(provider_tag));
+                        msg.citations = citations;
+                        Ok(msg)
+                    }
+                    Err(e) => {
+                        let (summary_text, key_points_raw, _, _) =
+                            generate_summary_pure(&sentences_fallback, 5, &length_str);
+                        let mut citations_set = std::collections::BTreeSet::new();
+                        for (page, _) in &key_points_raw {
+                            citations_set.insert(*page);
+                        }
+                        let citations: Vec<CitationUi> = citations_set.into_iter().map(|p| CitationUi { page: p, score: None }).collect();
+
+                        let fallback_content = format!(
+                            "⚠️ **{provider_tag} was unavailable:** {e}\n\n*Displaying built-in offline summary as fallback:*\n\n{summary_text}"
+                        );
+                        let mut msg = AiMessage::assistant(fallback_content, Some("Offline Fallback".to_string()));
+                        msg.citations = citations;
+                        msg.key_points = key_points_raw;
+                        Ok(msg)
+                    }
+                };
+                let _ = tx.send(res);
+            });
         }
-        let citations: Vec<CitationUi> = citations_set.into_iter().map(|p| CitationUi { page: p, score: None }).collect();
-
-        self.history.push(AiMessage {
-            role: AiRole::Assistant,
-            content: summary_text,
-            citations,
-            findings: Vec::new(),
-            alt_suggestions: Vec::new(),
-            key_points: key_points_raw,
-        });
     }
 
     /// Generate key takeaways.
     pub fn trigger_key_insights(&mut self, doc: &pdfcraft_engine::Document, view: &DocView) {
-        self.history.push(AiMessage {
-            role: AiRole::User,
-            content: "Extract key insights and core takeaways".to_string(),
-            citations: Vec::new(),
-            findings: Vec::new(),
-            alt_suggestions: Vec::new(),
-            key_points: Vec::new(),
-        });
+        if self.is_busy {
+            return;
+        }
+
+        self.history.push(AiMessage::user("Extract key insights and core takeaways"));
 
         let texts = extract_all_page_texts(doc, view);
         let sentences = collect_all_sentences(&texts);
-        let (_, key_points_raw, _, _) = generate_summary_pure(&sentences, 6, "detailed");
 
-        let mut citations_set = std::collections::BTreeSet::new();
-        for (page, _) in &key_points_raw {
-            citations_set.insert(*page);
+        if self.provider_mode == ProviderMode::Builtin {
+            let (_, key_points_raw, _, _) = generate_summary_pure(&sentences, 6, "detailed");
+
+            let mut citations_set = std::collections::BTreeSet::new();
+            for (page, _) in &key_points_raw {
+                citations_set.insert(*page);
+            }
+            let citations: Vec<CitationUi> = citations_set.into_iter().map(|p| CitationUi { page: p, score: None }).collect();
+
+            let mut msg = AiMessage::assistant(
+                "Here are the primary insights and core takeaways extracted from the document:",
+                Some("Offline Sovereign".to_string()),
+            );
+            msg.citations = citations;
+            msg.key_points = key_points_raw;
+            self.history.push(msg);
+        } else {
+            let mut doc_context = String::new();
+            for (p, text) in &texts {
+                doc_context.push_str(&format!("\n--- Page {} ---\n", p + 1));
+                doc_context.push_str(&text.plain_text());
+            }
+
+            let config = pdfcraft_automation::ai::ProviderConfig {
+                enabled: true,
+                mode: pdfcraft_automation::ai::ProviderMode::Endpoint,
+                endpoint: Some(self.endpoint_url.clone()),
+                model: Some(self.model_name.clone()),
+                api_key: if self.api_key.trim().is_empty() { None } else { Some(self.api_key.clone()) },
+            };
+
+            let provider_name = if self.endpoint_url.contains("googleapis.com") || self.endpoint_url.contains("gemini") {
+                format!("Google Gemini ({})", self.model_name)
+            } else if self.endpoint_url.contains("11434") {
+                format!("Ollama ({})", self.model_name)
+            } else if self.endpoint_url.contains("groq.com") {
+                format!("Groq Cloud ({})", self.model_name)
+            } else {
+                format!("AI Endpoint ({})", self.model_name)
+            };
+
+            self.is_busy = true;
+            self.busy_label = format!("Extracting key takeaways with {provider_name}…");
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.pending_rx = Some(rx);
+
+            let sentences_fallback = sentences.clone();
+            let provider_tag = provider_name.clone();
+
+            std::thread::spawn(move || {
+                let system_prompt = "You are an expert document analyst. Extract the primary core insights, high-impact findings, and essential takeaways from the provided PDF document.\n\
+Format your response with numbered or bulleted key takeaways with clear bold headlines.\n\
+Always cite the exact source pages using [Page n] brackets.";
+
+                let user_prompt = format!("Extract high-impact key insights from this document:\n{doc_context}");
+
+                let res = match pdfcraft_automation::ai::call_llm_endpoint(&config, Some(system_prompt), &user_prompt) {
+                    Ok(resp) => {
+                        let mut citations = Vec::new();
+                        for p in pdfcraft_automation::ai::extract_page_citations(&resp) {
+                            citations.push(CitationUi { page: p, score: None });
+                        }
+                        let mut msg = AiMessage::assistant(resp, Some(provider_tag));
+                        msg.citations = citations;
+                        Ok(msg)
+                    }
+                    Err(e) => {
+                        let (_, key_points_raw, _, _) = generate_summary_pure(&sentences_fallback, 6, "detailed");
+                        let mut citations_set = std::collections::BTreeSet::new();
+                        for (page, _) in &key_points_raw {
+                            citations_set.insert(*page);
+                        }
+                        let citations: Vec<CitationUi> = citations_set.into_iter().map(|p| CitationUi { page: p, score: None }).collect();
+
+                        let fallback_content = format!(
+                            "⚠️ **{provider_tag} was unavailable:** {e}\n\n*Displaying built-in offline insights as fallback:*"
+                        );
+                        let mut msg = AiMessage::assistant(fallback_content, Some("Offline Fallback".to_string()));
+                        msg.citations = citations;
+                        msg.key_points = key_points_raw;
+                        Ok(msg)
+                    }
+                };
+                let _ = tx.send(res);
+            });
         }
-        let citations: Vec<CitationUi> = citations_set.into_iter().map(|p| CitationUi { page: p, score: None }).collect();
-
-        self.history.push(AiMessage {
-            role: AiRole::Assistant,
-            content: "Here are the primary insights and core takeaways extracted from the document:".to_string(),
-            citations,
-            findings: Vec::new(),
-            alt_suggestions: Vec::new(),
-            key_points: key_points_raw,
-        });
     }
 
     /// Scan for sensitive PII and compliance findings.
     pub fn trigger_pii_scan(&mut self, doc: &pdfcraft_engine::Document, view: &DocView) {
-        self.history.push(AiMessage {
-            role: AiRole::User,
-            content: "Audit document for sensitive PII and confidential credentials".to_string(),
-            citations: Vec::new(),
-            findings: Vec::new(),
-            alt_suggestions: Vec::new(),
-            key_points: Vec::new(),
-        });
+        if self.is_busy {
+            return;
+        }
+
+        self.history.push(AiMessage::user("Audit document for sensitive PII and confidential credentials"));
 
         let texts_pair = extract_all_page_texts(doc, view);
         let pages: Vec<usize> = texts_pair.iter().map(|(p, _)| *p).collect();
@@ -293,14 +466,10 @@ impl AiState {
         let raw_findings = scan_sensitive_findings(&pages, &texts, &doc.info, ScanOptions::default());
 
         if raw_findings.is_empty() {
-            self.history.push(AiMessage {
-                role: AiRole::Assistant,
-                content: "Privacy audit complete. Zero unmasked sensitive entities (SSNs, payment cards, emails, phone numbers, API keys, or IP addresses) detected across any page.".to_string(),
-                citations: Vec::new(),
-                findings: Vec::new(),
-                alt_suggestions: Vec::new(),
-                key_points: Vec::new(),
-            });
+            self.history.push(AiMessage::assistant(
+                "Privacy audit complete. Zero unmasked sensitive entities (SSNs, payment cards, emails, phone numbers, API keys, or IP addresses) detected across any page.",
+                Some("Privacy Audit".to_string()),
+            ));
         } else {
             let count = raw_findings.len();
             let findings_ui: Vec<FindingUi> = raw_findings
@@ -321,27 +490,19 @@ impl AiState {
                 format!("Detected {count} sensitive entities requiring redaction verification:")
             };
 
-            self.history.push(AiMessage {
-                role: AiRole::Assistant,
-                content: header_msg,
-                citations: Vec::new(),
-                findings: findings_ui,
-                alt_suggestions: Vec::new(),
-                key_points: Vec::new(),
-            });
+            let mut msg = AiMessage::assistant(header_msg, Some("Privacy Audit".to_string()));
+            msg.findings = findings_ui;
+            self.history.push(msg);
         }
     }
 
     /// Scan and generate WCAG 2.2 accessible alt-text suggestions.
     pub fn trigger_alt_text_scan(&mut self, doc: &pdfcraft_engine::Document, view: &DocView) {
-        self.history.push(AiMessage {
-            role: AiRole::User,
-            content: "Audit accessibility: suggest alt-text for figures and illustrations".to_string(),
-            citations: Vec::new(),
-            findings: Vec::new(),
-            alt_suggestions: Vec::new(),
-            key_points: Vec::new(),
-        });
+        if self.is_busy {
+            return;
+        }
+
+        self.history.push(AiMessage::user("Audit accessibility: suggest alt-text for figures and illustrations"));
 
         let texts_pair = extract_all_page_texts(doc, view);
         let mut suggestions = Vec::new();
@@ -394,66 +555,121 @@ impl AiState {
         }
 
         if suggestions.is_empty() {
-            self.history.push(AiMessage {
-                role: AiRole::Assistant,
-                content: "Accessibility audit complete. All figures and graphics in this document already have accessible alternative text.".to_string(),
-                citations: Vec::new(),
-                findings: Vec::new(),
-                alt_suggestions: Vec::new(),
-                key_points: Vec::new(),
-            });
+            self.history.push(AiMessage::assistant(
+                "Accessibility audit complete. All figures and graphics in this document already have accessible alternative text.",
+                Some("Accessibility Audit".to_string()),
+            ));
         } else {
             let count = suggestions.len();
-            self.history.push(AiMessage {
-                role: AiRole::Assistant,
-                content: format!("Identified {count} figures missing accessible descriptions:"),
-                citations: Vec::new(),
-                findings: Vec::new(),
-                alt_suggestions: suggestions,
-                key_points: Vec::new(),
-            });
+            let mut msg = AiMessage::assistant(
+                format!("Identified {count} figures missing accessible descriptions:"),
+                Some("Accessibility Audit".to_string()),
+            );
+            msg.alt_suggestions = suggestions;
+            self.history.push(msg);
         }
     }
 
-    /// Ask user question using BM25 semantic retrieval over sentences.
+    /// Ask user question using BM25 semantic retrieval over sentences or external endpoint.
     pub fn trigger_question(&mut self, question: &str, doc: &pdfcraft_engine::Document, view: &DocView) {
         let q_trimmed = question.trim();
-        if q_trimmed.is_empty() {
+        if q_trimmed.is_empty() || self.is_busy {
             return;
         }
 
-        self.history.push(AiMessage {
-            role: AiRole::User,
-            content: q_trimmed.to_string(),
-            citations: Vec::new(),
-            findings: Vec::new(),
-            alt_suggestions: Vec::new(),
-            key_points: Vec::new(),
-        });
+        self.history.push(AiMessage::user(q_trimmed));
 
         let texts = extract_all_page_texts(doc, view);
         let sentences = collect_all_sentences(&texts);
-        let (answer, confidence, citations_raw) = search_answer_pure(q_trimmed, &sentences, 3);
 
-        let citations: Vec<CitationUi> = citations_raw
-            .into_iter()
-            .map(|(page, _, score)| CitationUi { page, score: Some(score) })
-            .collect();
+        if self.provider_mode == ProviderMode::Builtin {
+            let (answer, confidence, citations_raw) = search_answer_pure(q_trimmed, &sentences, 3);
 
-        let formatted_answer = match confidence {
-            "high" => answer,
-            _ => format!("{answer} (Note: Moderate match confidence based on offline document index)"),
-        };
+            let citations: Vec<CitationUi> = citations_raw
+                .into_iter()
+                .map(|(page, _, score)| CitationUi { page, score: Some(score) })
+                .collect();
 
-        self.history.push(AiMessage {
-            role: AiRole::Assistant,
-            content: formatted_answer,
-            citations,
-            findings: Vec::new(),
-            alt_suggestions: Vec::new(),
-            key_points: Vec::new(),
-        });
+            let formatted_answer = match confidence {
+                "high" => answer,
+                _ => format!("{answer} (Note: Moderate match confidence based on offline document index)"),
+            };
+
+            let mut msg = AiMessage::assistant(formatted_answer, Some("Offline Sovereign".to_string()));
+            msg.citations = citations;
+            self.history.push(msg);
+        } else {
+            let mut doc_context = String::new();
+            for (p, text) in &texts {
+                doc_context.push_str(&format!("\n--- Page {} ---\n", p + 1));
+                doc_context.push_str(&text.plain_text());
+            }
+
+            let config = pdfcraft_automation::ai::ProviderConfig {
+                enabled: true,
+                mode: pdfcraft_automation::ai::ProviderMode::Endpoint,
+                endpoint: Some(self.endpoint_url.clone()),
+                model: Some(self.model_name.clone()),
+                api_key: if self.api_key.trim().is_empty() { None } else { Some(self.api_key.clone()) },
+            };
+
+            let provider_name = if self.endpoint_url.contains("googleapis.com") || self.endpoint_url.contains("gemini") {
+                format!("Google Gemini ({})", self.model_name)
+            } else if self.endpoint_url.contains("11434") {
+                format!("Ollama ({})", self.model_name)
+            } else if self.endpoint_url.contains("groq.com") {
+                format!("Groq Cloud ({})", self.model_name)
+            } else {
+                format!("AI Endpoint ({})", self.model_name)
+            };
+
+            self.is_busy = true;
+            self.busy_label = format!("Thinking with {provider_name}…");
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.pending_rx = Some(rx);
+
+            let q_str = q_trimmed.to_string();
+            let sentences_fallback = sentences.clone();
+            let provider_tag = provider_name.clone();
+
+            std::thread::spawn(move || {
+                let system_prompt = "You are an expert document assistant answering questions based on the provided PDF document.\n\
+Answer accurately and concisely using ONLY the provided text.\n\
+Always cite the source pages using [Page n] brackets where the information was found.\n\
+If the answer is not contained in the text, state clearly that the document does not contain this information.";
+
+                let user_prompt = format!("Question: {q_str}\n\nDocument Context:\n{doc_context}");
+
+                let res = match pdfcraft_automation::ai::call_llm_endpoint(&config, Some(system_prompt), &user_prompt) {
+                    Ok(resp) => {
+                        let mut citations = Vec::new();
+                        for p in pdfcraft_automation::ai::extract_page_citations(&resp) {
+                            citations.push(CitationUi { page: p, score: None });
+                        }
+                        let mut msg = AiMessage::assistant(resp, Some(provider_tag));
+                        msg.citations = citations;
+                        Ok(msg)
+                    }
+                    Err(e) => {
+                        let (answer, _, citations_raw) = search_answer_pure(&q_str, &sentences_fallback, 3);
+                        let citations: Vec<CitationUi> = citations_raw
+                            .into_iter()
+                            .map(|(page, _, score)| CitationUi { page, score: Some(score) })
+                            .collect();
+                        let fallback_content = format!(
+                            "⚠️ **{provider_tag} was unavailable:** {e}\n\n*Offline Search Answer:*\n{answer}"
+                        );
+                        let mut msg = AiMessage::assistant(fallback_content, Some("Offline Fallback".to_string()));
+                        msg.citations = citations;
+                        Ok(msg)
+                    }
+                };
+                let _ = tx.send(res);
+            });
+        }
     }
+
 }
 
 /// Paint an interactive executive telemetry badge card.
@@ -577,6 +793,93 @@ fn render_quick_prompts(
     });
 }
 
+/// Render text containing markdown headers, bullet lists, and clickable page citations.
+fn render_formatted_content(ui: &mut egui::Ui, t: &Tokens, content: &str, action_out: &mut Option<AiPanelAction>) {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            ui.add_space(4.0);
+            continue;
+        }
+
+        if let Some(h1) = trimmed.strip_prefix("# ") {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(h1).font(theme::semibold(14.0)).color(t.accent_text));
+            ui.add_space(2.0);
+        } else if let Some(h2) = trimmed.strip_prefix("## ") {
+            ui.add_space(5.0);
+            ui.label(egui::RichText::new(h2).font(theme::semibold(13.5)).color(t.accent_text));
+            ui.add_space(2.0);
+        } else if let Some(h3) = trimmed.strip_prefix("### ") {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(h3).font(theme::semibold(13.0)).color(t.text));
+            ui.add_space(2.0);
+        } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("• ") {
+            let bullet_text = &trimmed[2..];
+            ui.horizontal_top(|ui| {
+                ui.label(egui::RichText::new("•").font(theme::semibold(14.0)).color(t.accent));
+                render_text_segment(ui, t, bullet_text, action_out);
+            });
+            ui.add_space(2.0);
+        } else {
+            render_text_segment(ui, t, trimmed, action_out);
+            ui.add_space(2.0);
+        }
+    }
+}
+
+/// Render an individual line or bullet text, converting any inline `[Page n]` citations into clickable buttons.
+fn render_text_segment(ui: &mut egui::Ui, t: &Tokens, text: &str, action_out: &mut Option<AiPanelAction>) {
+    let lower = text.to_lowercase();
+    let mut search_from = 0;
+    let mut segments = Vec::new();
+
+    while let Some(idx) = lower[search_from..].find("[page ") {
+        let abs_start = search_from + idx;
+        let rest = &lower[abs_start + 6..];
+        if let Some(end_bracket) = rest.find(']') {
+            let abs_end = abs_start + 6 + end_bracket + 1;
+            let num_str = rest[..end_bracket].trim();
+            if let Ok(p) = num_str.parse::<usize>() {
+                if abs_start > search_from {
+                    segments.push((&text[search_from..abs_start], None));
+                }
+                segments.push((&text[abs_start..abs_end], Some(p)));
+                search_from = abs_end;
+                continue;
+            }
+        }
+        search_from = abs_start + 6;
+    }
+
+    if segments.is_empty() {
+        widgets::wrapped_text(ui, text, theme::regular(12.5), t.text, false);
+    } else {
+        if search_from < text.len() {
+            segments.push((&text[search_from..], None));
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (seg, maybe_page) in segments {
+                if let Some(p) = maybe_page {
+                    let btn = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new(format!("[p.{p}]")).font(theme::medium(11.0)).color(t.accent_text),
+                        )
+                        .fill(t.accent_soft)
+                        .stroke(Stroke::new(1.0, t.accent.gamma_multiply(0.25)))
+                        .corner_radius(CornerRadius::same(4)),
+                    );
+                    if btn.on_hover_text(format!("Jump to page {p}")).clicked() {
+                        *action_out = Some(AiPanelAction::GoToPage(p.saturating_sub(1)));
+                    }
+                } else if !seg.is_empty() {
+                    ui.label(egui::RichText::new(seg).font(theme::regular(12.5)).color(t.text));
+                }
+            }
+        });
+    }
+}
+
 /// Paint a single message card with formatted text, citations, and actions.
 fn render_message_card(
     ui: &mut egui::Ui,
@@ -614,6 +917,12 @@ fn render_message_card(
                     ui.add_space(18.0);
                     ui.label(egui::RichText::new("PdfCraft Assistant").font(theme::semibold(12.0)).color(t.accent_text));
 
+                    if let Some(ref tag) = msg.provider_tag {
+                        ui.add_space(4.0);
+                        let tag_text = egui::RichText::new(tag).font(theme::medium(10.0)).color(t.text_muted);
+                        ui.add(egui::Label::new(tag_text).selectable(false));
+                    }
+
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if icons::button(ui, "copy", 22.0, false, "Copy full response to clipboard").clicked() {
                             let mut full_copy = msg.content.clone();
@@ -630,8 +939,8 @@ fn render_message_card(
 
                 ui.add_space(4.0);
 
-                // Body content
-                widgets::wrapped_text(ui, &msg.content, theme::regular(13.0), t.text, false);
+                // Body content with markdown and inline citations
+                render_formatted_content(ui, t, &msg.content, action_out);
 
                 // Render key points if present
                 if !msg.key_points.is_empty() {
@@ -811,7 +1120,7 @@ fn render_message_card(
     }
 }
 
-/// Paint the settings drawer for endpoint configuration.
+/// Paint the settings drawer for model and endpoint configuration.
 fn render_settings_drawer(ui: &mut egui::Ui, t: &Tokens, state: &mut AiState) {
     let frame = egui::Frame::new()
         .fill(t.field)
@@ -820,26 +1129,117 @@ fn render_settings_drawer(ui: &mut egui::Ui, t: &Tokens, state: &mut AiState) {
         .inner_margin(egui::Margin::symmetric(10, 8));
 
     frame.show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Execution Mode:").font(theme::semibold(12.0)).color(t.text));
-            if ui.selectable_label(state.provider_mode == ProviderMode::Builtin, "Offline Sovereign").clicked() {
+        widgets::section_title(ui, "Model & Provider Presets");
+
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+
+            let is_builtin = state.provider_mode == ProviderMode::Builtin;
+            let is_ollama = state.provider_mode == ProviderMode::Endpoint && state.endpoint_url.contains("11434");
+            let is_gemini = state.provider_mode == ProviderMode::Endpoint && (state.endpoint_url.contains("googleapis.com") || state.endpoint_url.contains("gemini"));
+            let is_groq = state.provider_mode == ProviderMode::Endpoint && state.endpoint_url.contains("groq.com");
+            let is_custom = state.provider_mode == ProviderMode::Endpoint && !is_ollama && !is_gemini && !is_groq;
+
+            let preset_btn = |ui: &mut egui::Ui, label: &str, active: bool, tip: &str| {
+                ui.add(
+                    egui::Button::new(
+                        egui::RichText::new(label)
+                            .font(theme::semibold(11.0))
+                            .color(if active { t.accent_text } else { t.text }),
+                    )
+                    .fill(if active { t.accent_soft } else { t.card })
+                    .stroke(if active { Stroke::new(1.0, t.accent.gamma_multiply(0.5)) } else { Stroke::new(1.0, t.border) })
+                    .corner_radius(CornerRadius::same(6)),
+                )
+                .on_hover_text(tip)
+                .clicked()
+            };
+
+            if preset_btn(ui, "🛡️ Offline Sovereign", is_builtin, "100% Offline: zero network access, local heuristics and BM25 ranking") {
                 state.provider_mode = ProviderMode::Builtin;
             }
-            if ui.selectable_label(state.provider_mode == ProviderMode::Endpoint, "Local Endpoint").clicked() {
+
+            if preset_btn(ui, "🦙 Local Ollama", is_ollama, "Run local models (llama3.2, mistral, gemma2) via Ollama with zero API key") {
                 state.provider_mode = ProviderMode::Endpoint;
+                state.endpoint_url = "http://localhost:11434".to_string();
+                if state.model_name.is_empty() || state.model_name == "gemini-1.5-flash" || state.model_name == "llama-3.3-70b-versatile" {
+                    state.model_name = "llama3.2".to_string();
+                }
+            }
+
+            if preset_btn(ui, "⚡ Google Gemini (Free)", is_gemini, "Free tier Google Gemini 1.5 Flash via Google AI Studio API key") {
+                state.provider_mode = ProviderMode::Endpoint;
+                state.endpoint_url = "https://generativelanguage.googleapis.com".to_string();
+                state.model_name = "gemini-1.5-flash".to_string();
+            }
+
+            if preset_btn(ui, "🚀 Groq Cloud (Free 70B)", is_groq, "Ultra-fast free tier Llama 3.3 70B hosted on Groq") {
+                state.provider_mode = ProviderMode::Endpoint;
+                state.endpoint_url = "https://api.groq.com/openai/v1".to_string();
+                state.model_name = "llama-3.3-70b-versatile".to_string();
+            }
+
+            if preset_btn(ui, "⚙️ Custom / LM Studio", is_custom, "Custom OpenAI-compatible local server or proxy") {
+                state.provider_mode = ProviderMode::Endpoint;
+                if state.endpoint_url.contains("googleapis.com") || state.endpoint_url.contains("groq.com") {
+                    state.endpoint_url = "http://localhost:1234/v1".to_string();
+                    state.model_name = "local-model".to_string();
+                }
             }
         });
 
         if state.provider_mode == ProviderMode::Endpoint {
-            ui.add_space(4.0);
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("URL:").font(theme::medium(11.5)).color(t.text_muted));
-                ui.add(egui::TextEdit::singleline(&mut state.endpoint_url).hint_text("http://localhost:11434").desired_width(160.0));
+                ui.label(egui::RichText::new("Endpoint URL:").font(theme::medium(11.5)).color(t.text_muted));
+                ui.add(egui::TextEdit::singleline(&mut state.endpoint_url).hint_text("http://localhost:11434").desired_width(ui.available_width() - 8.0));
             });
+
+            ui.add_space(3.0);
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Model:").font(theme::medium(11.5)).color(t.text_muted));
+                ui.label(egui::RichText::new("Model Name:").font(theme::medium(11.5)).color(t.text_muted));
                 ui.add(egui::TextEdit::singleline(&mut state.model_name).hint_text("llama3.2").desired_width(160.0));
             });
+
+            let is_gemini = state.endpoint_url.contains("googleapis.com") || state.endpoint_url.contains("gemini");
+            let is_groq = state.endpoint_url.contains("groq.com");
+            let is_ollama = state.endpoint_url.contains("11434");
+
+            if is_gemini || is_groq || !state.api_key.is_empty() {
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("API Key:").font(theme::medium(11.5)).color(t.text_muted));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.api_key)
+                            .password(true)
+                            .hint_text("Enter API key…")
+                            .desired_width(ui.available_width() - 8.0),
+                    );
+                });
+
+                if is_gemini {
+                    ui.label(
+                        egui::RichText::new("💡 Get your free API key at https://aistudio.google.com")
+                            .font(theme::regular(10.5))
+                            .color(t.accent_text),
+                    );
+                } else if is_groq {
+                    ui.label(
+                        egui::RichText::new("💡 Get your free API key at https://console.groq.com")
+                            .font(theme::regular(10.5))
+                            .color(t.accent_text),
+                    );
+                }
+            } else if is_ollama {
+                ui.label(
+                    egui::RichText::new("💡 Running locally via Ollama. No API key needed. Start with `ollama run llama3.2`")
+                        .font(theme::regular(10.5))
+                        .color(t.text_muted),
+                );
+            }
         }
     });
     ui.add_space(6.0);
@@ -856,11 +1256,48 @@ pub fn panel_content(
     widgets::begin_dialog(ui);
     state.sync_doc(doc, view);
 
+    // Poll pending background AI task
+    if let Some(ref rx) = state.pending_rx {
+        match rx.try_recv() {
+            Ok(res) => {
+                state.is_busy = false;
+                state.pending_rx = None;
+                match res {
+                    Ok(msg) => state.history.push(msg),
+                    Err(err) => {
+                        state.history.push(AiMessage {
+                            role: AiRole::Assistant,
+                            content: format!("⚠️ AI generation error: {err}"),
+                            citations: Vec::new(),
+                            findings: Vec::new(),
+                            alt_suggestions: Vec::new(),
+                            key_points: Vec::new(),
+                            provider_tag: Some("Error".to_string()),
+                        });
+                    }
+                }
+                ui.ctx().request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ui.ctx().request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                state.is_busy = false;
+                state.pending_rx = None;
+            }
+        }
+    }
+
     let mut action_out = None;
 
     // Header strip controls: settings, clear history, close
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Offline Sovereign AI").font(theme::semibold(14.0)).color(t.text));
+        let title = if state.provider_mode == ProviderMode::Endpoint {
+            "AI Assistant (Connected)"
+        } else {
+            "Offline Sovereign AI"
+        };
+        ui.label(egui::RichText::new(title).font(theme::semibold(14.0)).color(t.text));
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if icons::button(ui, "trash-2", 24.0, false, "Clear conversation history").clicked() {
@@ -898,7 +1335,7 @@ pub fn panel_content(
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
 
-            if state.history.is_empty() {
+            if state.history.is_empty() && !state.is_busy {
                 let empty_frame = egui::Frame::new()
                     .fill(t.card)
                     .stroke(Stroke::new(1.0, t.border))
@@ -923,6 +1360,23 @@ pub fn panel_content(
                     render_message_card(ui, t, msg, &mut action_out);
                 }
             }
+
+            // In-flight spinner card
+            if state.is_busy {
+                let busy_frame = egui::Frame::new()
+                    .fill(t.card)
+                    .stroke(Stroke::new(1.0, t.border))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(14, 10));
+
+                busy_frame.show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(&state.busy_label).font(theme::medium(12.5)).color(t.text));
+                    });
+                });
+            }
         });
 
     ui.add_space(6.0);
@@ -937,9 +1391,16 @@ pub fn panel_content(
     input_frame.show(ui, |ui| {
         ui.horizontal(|ui| {
             let edit_width = (ui.available_width() - 32.0).max(40.0);
-            let edit_resp = ui.add(
+            let hint = if state.is_busy {
+                "Generating response…"
+            } else {
+                "Ask anything about this PDF…"
+            };
+
+            let edit_resp = ui.add_enabled(
+                !state.is_busy,
                 egui::TextEdit::singleline(&mut state.input)
-                    .hint_text("Ask anything about this PDF…")
+                    .hint_text(hint)
                     .desired_width(edit_width)
                     .frame(egui::Frame::NONE),
             );
@@ -947,7 +1408,7 @@ pub fn panel_content(
             let enter_pressed = edit_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let send_clicked = icons::button(ui, "send", 26.0, false, "Send question").clicked();
 
-            if (enter_pressed || send_clicked) && !state.input.trim().is_empty() {
+            if (enter_pressed || send_clicked) && !state.input.trim().is_empty() && !state.is_busy {
                 let q = std::mem::take(&mut state.input);
                 state.trigger_question(&q, doc, view);
             }
@@ -956,3 +1417,4 @@ pub fn panel_content(
 
     action_out
 }
+

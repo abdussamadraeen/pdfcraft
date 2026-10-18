@@ -4011,9 +4011,11 @@ dependencies = [
  "pdfcraft-render",
  "pdfcraft-xfa",
  "png 0.18.1",
+ "rustls-native-certs",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+ "ureq",
 ]
 
 [[package]]

@@ -1078,8 +1078,37 @@ pub(crate) fn page_input(
         view.block_drag = Some(BlockDrag { page, block, generation: doc.edit_generation(), start: o, grip });
         return true;
     }
-    let Some(p) = ui.input(|i| i.pointer.hover_pos()).filter(|p| xf.rect.contains(*p)) else { return false };
-    let Some((hit, grip)) = grab_at(&boxes, p, upright) else { return false };
+    let hover_pos = ui.input(|i| i.pointer.hover_pos()).filter(|p| xf.rect.contains(*p));
+    let hit_grip = hover_pos.and_then(|p| grab_at(&boxes, p, upright));
+
+    if resp.clicked() {
+        view.image_selection = None;
+        if let Some(open) = view.line_editor.as_ref() {
+            if hit_grip.is_some_and(|(hit, _)| open.page == page && open.block == hit) {
+                // Clicked inside the open paragraph; keep it open.
+                return true;
+            }
+            // Clicked outside the open paragraph (either on blank space or another box):
+            // apply current changes first.
+            if let Some(old) = view.line_editor.take() {
+                let style = old.style();
+                if old.text != old.original || style != pdfcraft_engine::BlockStyle::default() {
+                    view.pending_edit = Some(Edit::EditTextBlock { page: old.page, block: old.block, text: old.text, style });
+                }
+            }
+            ui.ctx().memory_mut(|mem| mem.stop_text_input());
+            if let Some((hit, _)) = hit_grip {
+                view.pending_text_open = Some((page, hit));
+            }
+            return true;
+        }
+        if let Some((hit, _)) = hit_grip {
+            open_editor(ui, xf, doc, lines, &boxes, page, hit, view);
+            return true;
+        }
+    }
+
+    let Some((hit, grip)) = hit_grip else { return false };
     if active != Some(hit) {
         painter.rect_stroke(boxes[hit], CornerRadius::same(2), Stroke::new(1.5, ACCENT), egui::StrokeKind::Outside);
     }
@@ -1096,27 +1125,6 @@ pub(crate) fn page_input(
     } else {
         egui::CursorIcon::Text
     });
-    if resp.clicked() {
-        view.image_selection = None;
-        // A click that moves the editor to another paragraph applies the open one first, so its
-        // typed text is not dropped with the switched-away editor (#2022). A click on the open
-        // box's own frame, which the editor's overlay does not cover, keeps it open instead.
-        if let Some(open) = view.line_editor.as_ref().filter(|e| e.has_changes()) {
-            if open.page == page && open.block == hit {
-                return true;
-            }
-            if let Some(old) = view.line_editor.take() {
-                let style = old.style();
-                if old.text != old.original || style != pdfcraft_engine::BlockStyle::default() {
-                    view.pending_edit = Some(Edit::EditTextBlock { page: old.page, block: old.block, text: old.text, style });
-                }
-            }
-            // The clicked box opens next frame, from the document with that edit applied.
-            view.pending_text_open = Some((page, hit));
-            return true;
-        }
-        open_editor(ui, xf, doc, lines, &boxes, page, hit, view);
-    }
     true
 }
 
@@ -1308,8 +1316,9 @@ fn editor_galley(ui: &egui::Ui, ed: &LineEditor, text: &str, scale: f32, width: 
 
 /// The inline editor; returns the edit once the text is applied.
 pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -> Option<Edit> {
+    let viewport_rect = view.viewport_rect();
     // Clicks outside the document (the Format text panel) keep the paragraph open.
-    let outside = ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| !view.viewport_rect().contains(p));
+    let outside = ctx.input(|i| i.pointer.latest_pos()).is_some_and(|p| !viewport_rect.contains(p));
     let page = view.line_editor.as_ref()?.page;
     let xf = view.page_xform(page)?;
     let hold = view.objects.hold_editor;
@@ -1413,9 +1422,13 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
                 }
                 let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
                 let apply = ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command);
+                let pressed_outside = !outside && !hold && ui.input(|i| i.pointer.primary_pressed()) && {
+                    let p = ui.input(|i| i.pointer.press_origin().or_else(|| i.pointer.latest_pos()));
+                    p.is_some_and(|pos| viewport_rect.contains(pos) && !live.expand(2.0 + FRAME_REACH).contains(pos))
+                };
                 if esc {
                     done = Some(false);
-                } else if apply || (r.lost_focus() && !outside && !hold) {
+                } else if apply || pressed_outside || (r.lost_focus() && !outside && !hold) {
                     done = Some(true);
                 }
             });
@@ -1423,6 +1436,7 @@ pub(crate) fn overlay(ctx: &egui::Context, view: &mut DocView, info: &DocInfo) -
     );
     match done {
         Some(apply) => {
+            ctx.memory_mut(|mem| mem.stop_text_input());
             let ed = view.line_editor.take()?;
             if apply { finished_edit(ed) } else { None }
         }

@@ -2704,6 +2704,12 @@ pub fn document_area(app: &mut PdfCraftApp, index: usize, ui: &mut egui::Ui) {
     } else {
         view.prepare.selected = None;
     }
+    if tool != QuickTool::EditText
+        && let Some(ed) = view.line_editor.take()
+        && let Some(edit) = crate::edit_text_ui::finished_edit(ed)
+    {
+        view.pending_edit = Some(edit);
+    }
     view.objects.prepare(doc, tool == QuickTool::EditText && can_modify, ui.ctx());
     view.text_background.prepare(ui.ctx(), doc, view.line_editor.as_ref(), view.content.draft.as_ref(), scale);
     let added = if editing_content { doc.added().to_vec() } else { Vec::new() };

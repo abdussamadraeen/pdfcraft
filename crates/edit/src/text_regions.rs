@@ -346,7 +346,7 @@ pub(super) fn rewrite_styled_block(
     }
     let lines = styled_lines.as_slice();
     let p = page_dict(doc, page)?;
-    let mut res = p.dict.get(b"Resources").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
+    let mut res = inherited_page_resources(doc, p.obj);
     let mut fonts = res.get(b"Font").and_then(|r| doc.resolve(r).as_dict().cloned()).unwrap_or_default();
     for line in lines.iter().filter(|line| line.font.starts_with("PCRange")) {
         let mut f = Dict::new();
@@ -770,6 +770,9 @@ pub(super) fn rewrite_styled_block(
                     let code = u16::try_from(i + 1).map_err(|_| EditError::Invalid("shaped glyph limit".into()))?;
                     block_ops.push(Op::new("BT", vec![]));
                     block_ops.extend(state.ops());
+                    if block.invisible || state.render_mode == 3 {
+                        block_ops.push(Op::new("Tr", vec![Object::Int(0)]));
+                    }
                     block_ops.push(Op::new("Tm", matrix.map(n).to_vec()));
                     block_ops.push(Op::new("Tj", vec![Object::String(PdfString::literal(code.to_be_bytes().to_vec()))]));
                     block_ops.push(Op::new("ET", vec![]));
@@ -780,6 +783,9 @@ pub(super) fn rewrite_styled_block(
             } else {
                 block_ops.push(Op::new("BT", vec![]));
                 block_ops.extend(state.ops());
+                if block.invisible || state.render_mode == 3 {
+                    block_ops.push(Op::new("Tr", vec![Object::Int(0)]));
+                }
                 block_ops.push(Op::new("Tm", tm.iter().map(|v| n(*v)).collect()));
                 block_ops.extend(source_show(
                     m,

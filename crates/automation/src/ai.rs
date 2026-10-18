@@ -50,13 +50,279 @@ pub struct ProviderConfig {
     pub mode: ProviderMode,
     pub endpoint: Option<String>,
     pub model: Option<String>,
+    pub api_key: Option<String>,
 }
 
 impl Default for ProviderConfig {
     fn default() -> Self {
-        Self { enabled: false, mode: ProviderMode::Builtin, endpoint: None, model: None }
+        Self { enabled: false, mode: ProviderMode::Builtin, endpoint: None, model: None, api_key: None }
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_http_agent() -> std::result::Result<ureq::Agent, String> {
+    let mut builder = ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(60)));
+    let found = rustls_native_certs::load_native_certs();
+    let certs: Vec<ureq::tls::Certificate<'static>> =
+        found.certs.iter().map(|c| ureq::tls::Certificate::from_der(c.as_ref()).to_owned()).collect();
+    if !certs.is_empty() {
+        let roots = ureq::tls::RootCerts::new_with_certs(&certs);
+        builder = builder.tls_config(ureq::tls::TlsConfig::builder().root_certs(roots).build());
+    }
+    Ok(builder.build().new_agent())
+}
+
+/// Extract 1-based page citations like `[Page 3]` or `[p.3]` from LLM text.
+pub fn extract_page_citations(text: &str) -> Vec<usize> {
+    let mut pages = BTreeSet::new();
+    let lower = text.to_lowercase();
+    let mut search_from = 0;
+    while let Some(idx) = lower[search_from..].find("[page ") {
+        let abs_idx = search_from + idx + 6;
+        let rest = &lower[abs_idx..];
+        if let Some(end_bracket) = rest.find(']') {
+            let num_str = rest[..end_bracket].trim();
+            if let Ok(num) = num_str.parse::<usize>()
+                && num > 0
+            {
+                pages.insert(num);
+            }
+        }
+        search_from = abs_idx;
+    }
+    search_from = 0;
+    while let Some(idx) = lower[search_from..].find("[p.") {
+        let abs_idx = search_from + idx + 3;
+        let rest = &lower[abs_idx..];
+        if let Some(end_bracket) = rest.find(']') {
+            let num_str = rest[..end_bracket].trim();
+            if let Ok(num) = num_str.parse::<usize>()
+                && num > 0
+            {
+                pages.insert(num);
+            }
+        }
+        search_from = abs_idx;
+    }
+    pages.into_iter().collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn call_llm_endpoint(
+    config: &ProviderConfig,
+    system_prompt: Option<&str>,
+    user_prompt: &str,
+) -> std::result::Result<String, String> {
+    let agent = build_http_agent()?;
+    let raw_endpoint = config.endpoint.as_deref().unwrap_or("http://localhost:11434").trim();
+    let endpoint = raw_endpoint.trim_end_matches('/');
+
+    // 1. Google Gemini API
+    if endpoint.contains("googleapis.com") || endpoint.contains("gemini") {
+        let model = config.model.as_deref().unwrap_or("gemini-1.5-flash").trim();
+        let api_key = config.api_key.as_deref().unwrap_or("").trim();
+        if api_key.is_empty() {
+            return Err("Google Gemini requires an API key. Add your free key in AI Settings (get one at https://aistudio.google.com).".into());
+        }
+
+        let url = if endpoint.contains(":generateContent") {
+            if endpoint.contains("key=") {
+                endpoint.to_string()
+            } else {
+                format!("{endpoint}?key={api_key}")
+            }
+        } else {
+            format!("{endpoint}/v1beta/models/{model}:generateContent?key={api_key}")
+        };
+
+        let combined_text = if let Some(sys) = system_prompt {
+            format!("{sys}\n\n{user_prompt}")
+        } else {
+            user_prompt.to_string()
+        };
+
+        let req_body = serde_json::json!({
+            "contents": [
+                {
+                    "parts": [
+                        { "text": combined_text }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.2
+            }
+        });
+
+        let body_str = serde_json::to_string(&req_body).map_err(|e| e.to_string())?;
+        let mut resp = agent
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send(body_str.as_bytes())
+            .map_err(|e| format!("Gemini connection error: {e}"))?;
+
+        let status = resp.status().as_u16();
+        let resp_text = resp.body_mut().with_config().limit(1 << 23).read_to_string().map_err(|e| e.to_string())?;
+
+        if !(200..300).contains(&status) {
+            if let Ok(err_val) = serde_json::from_str::<serde_json::Value>(&resp_text)
+                && let Some(msg) = err_val.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str())
+            {
+                return Err(format!("Gemini API error ({status}): {msg}"));
+            }
+            return Err(format!("Gemini API error (HTTP {status}): {resp_text}"));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&resp_text).map_err(|e| format!("Invalid JSON from Gemini: {e}"))?;
+        let text = parsed
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c0| c0.get("content"))
+            .and_then(|cnt| cnt.get("parts"))
+            .and_then(|p| p.get(0))
+            .and_then(|p0| p0.get("text"))
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| "Gemini response did not contain candidates[0].content.parts[0].text".to_string())?;
+
+        return Ok(text.to_string());
+    }
+
+    // 2. Ollama Native API (port 11434 or /api/generate)
+    if (endpoint.contains("11434") || endpoint.ends_with("/api/generate")) && !endpoint.contains("/v1") {
+        let model = config.model.as_deref().unwrap_or("llama3.2").trim();
+        let url = if endpoint.ends_with("/api/generate") {
+            endpoint.to_string()
+        } else {
+            format!("{endpoint}/api/generate")
+        };
+
+        let mut req_body = serde_json::json!({
+            "model": model,
+            "prompt": user_prompt,
+            "stream": false,
+        });
+        if let Some(sys) = system_prompt {
+            req_body["system"] = serde_json::json!(sys);
+        }
+
+        let body_str = serde_json::to_string(&req_body).map_err(|e| e.to_string())?;
+        let mut resp = agent
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send(body_str.as_bytes())
+            .map_err(|e| format!("Ollama connection error: {e}. Is Ollama running on {endpoint}?"))?;
+
+        let status = resp.status().as_u16();
+        let resp_text = resp.body_mut().with_config().limit(1 << 23).read_to_string().map_err(|e| e.to_string())?;
+
+        if !(200..300).contains(&status) {
+            if let Ok(err_val) = serde_json::from_str::<serde_json::Value>(&resp_text)
+                && let Some(msg) = err_val.get("error").and_then(|m| m.as_str())
+            {
+                return Err(format!("Ollama error ({status}): {msg}"));
+            }
+            return Err(format!("Ollama error (HTTP {status}): {resp_text}"));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&resp_text).map_err(|e| format!("Invalid JSON from Ollama: {e}"))?;
+        let text = parsed
+            .get("response")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| "Ollama response did not contain 'response' field".to_string())?;
+
+        return Ok(text.to_string());
+    }
+
+    // 3. OpenAI-Compatible (Groq, LM Studio, OpenRouter, LocalAI)
+    let model = config.model.as_deref().unwrap_or_else(|| {
+        if endpoint.contains("groq.com") {
+            "llama-3.3-70b-versatile"
+        } else {
+            "gpt-3.5-turbo"
+        }
+    }).trim();
+
+    let url = if endpoint.ends_with("/chat/completions") {
+        endpoint.to_string()
+    } else {
+        format!("{endpoint}/chat/completions")
+    };
+
+    let mut messages = Vec::new();
+    if let Some(sys) = system_prompt {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": sys,
+        }));
+    }
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": user_prompt,
+    }));
+
+    let req_body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+    });
+
+    let body_str = serde_json::to_string(&req_body).map_err(|e| e.to_string())?;
+    let mut req = agent.post(&url).header("Content-Type", "application/json");
+
+    if let Some(ref key) = config.api_key {
+        let trimmed_key = key.trim();
+        if !trimmed_key.is_empty() {
+            req = req.header("Authorization", &format!("Bearer {trimmed_key}"));
+        }
+    }
+
+    let mut resp = req
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send(body_str.as_bytes())
+        .map_err(|e| format!("Endpoint connection error: {e}"))?;
+
+    let status = resp.status().as_u16();
+    let resp_text = resp.body_mut().with_config().limit(1 << 23).read_to_string().map_err(|e| e.to_string())?;
+
+    if !(200..300).contains(&status) {
+        if let Ok(err_val) = serde_json::from_str::<serde_json::Value>(&resp_text)
+            && let Some(msg) = err_val.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str())
+        {
+            return Err(format!("AI Endpoint error ({status}): {msg}"));
+        }
+        return Err(format!("AI Endpoint error (HTTP {status}): {resp_text}"));
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(&resp_text).map_err(|e| format!("Invalid JSON from endpoint: {e}"))?;
+    let text = parsed
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c0| c0.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| "Endpoint response did not contain choices[0].message.content".to_string())?;
+
+    Ok(text.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn call_llm_endpoint(
+    _config: &ProviderConfig,
+    _system_prompt: Option<&str>,
+    _user_prompt: &str,
+) -> std::result::Result<String, String> {
+    Err("Network LLM endpoints are not supported on WebAssembly".into())
+}
+
+
 
 /// Stop words filtered out during keyword extraction and semantic scoring.
 const STOP_WORDS: &[&str] = &[
@@ -1018,12 +1284,16 @@ impl Automation {
         if let Some(model) = a.opt_str("model")? {
             self.ai_provider.model = if model.trim().is_empty() { None } else { Some(model.to_string()) };
         }
+        if let Some(key) = a.opt_str("api_key")? {
+            self.ai_provider.api_key = if key.trim().is_empty() { None } else { Some(key.to_string()) };
+        }
 
         Ok(json!({
             "enabled": self.ai_provider.enabled,
             "mode": self.ai_provider.mode.as_str(),
             "endpoint": self.ai_provider.endpoint,
             "model": self.ai_provider.model,
+            "has_api_key": self.ai_provider.api_key.is_some(),
         }))
     }
 
@@ -1069,6 +1339,38 @@ impl Automation {
                 "citations": [],
             }));
         }
+
+        if self.ai_provider.mode == ProviderMode::Endpoint {
+            let mut doc_context = String::new();
+            for (p, text) in pages.iter().zip(&texts) {
+                doc_context.push_str(&format!("\n--- Page {} ---\n", p + 1));
+                doc_context.push_str(&text.plain_text());
+            }
+
+            let system_prompt = "You are an expert executive document analyst. Produce a comprehensive, professional Executive Summary of the provided PDF document.\n\
+Include clear sections for Executive Overview, Key Findings, Action Items, and Critical Risks.\n\
+When citing facts or data points, include exact page references like [Page 1], [Page 2].";
+
+            let user_prompt = format!("Summarize this document (detail level: {length_pref}, max key points: {max_points}):\n{doc_context}");
+
+            if let Ok(llm_response) = call_llm_endpoint(&self.ai_provider, Some(system_prompt), &user_prompt) {
+                let mut cited_pages = BTreeSet::new();
+                for p in extract_page_citations(&llm_response) {
+                    cited_pages.insert(p);
+                }
+
+                return Ok(json!({
+                    "summary": llm_response,
+                    "key_points": [],
+                    "word_count": total_words,
+                    "reading_time_minutes": ((total_words as f64) / 200.0).ceil() as usize,
+                    "page_count": pages.len(),
+                    "citations": cited_pages.into_iter().collect::<Vec<_>>(),
+                    "provider": "endpoint",
+                }));
+            }
+        }
+
 
         let (summary_text, key_points_raw, total_words, reading_time) =
             generate_summary_pure(&all_sentences, max_points, length_pref);
@@ -1127,7 +1429,42 @@ impl Automation {
             all_sentences.extend(page_sentences);
         }
 
+        if self.ai_provider.mode == ProviderMode::Endpoint {
+            let mut doc_context = String::new();
+            for (p, text) in pages.iter().zip(&texts) {
+                doc_context.push_str(&format!("\n--- Page {} ---\n", p + 1));
+                doc_context.push_str(&text.plain_text());
+            }
+
+            let system_prompt = "You are an expert assistant answering questions based on the provided PDF document.\n\
+Answer accurately and concisely using ONLY the provided text.\n\
+Always cite the source pages using [Page n] brackets where the information was found.\n\
+If the answer is not contained in the text, state clearly that the document does not contain this information.";
+
+            let user_prompt = format!("Question: {question}\n\nDocument Context:\n{doc_context}");
+
+            if let Ok(llm_response) = call_llm_endpoint(&self.ai_provider, Some(system_prompt), &user_prompt) {
+                let mut citations_found = Vec::new();
+                for p in extract_page_citations(&llm_response) {
+                    citations_found.push(json!({
+                        "page": p,
+                        "excerpt": format!("[Page {p}]"),
+                        "score": 1.0,
+                    }));
+                }
+
+                return Ok(json!({
+                    "question": question,
+                    "answer": llm_response,
+                    "confidence": "high",
+                    "citations": citations_found,
+                    "provider": "endpoint",
+                }));
+            }
+        }
+
         let (answer, confidence, citations_raw) = search_answer_pure(question, &all_sentences, max_citations);
+
 
         let citations: Vec<Value> = citations_raw
             .into_iter()

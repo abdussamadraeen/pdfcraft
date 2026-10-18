@@ -21,8 +21,11 @@ png = "0.18"
 base64 = { version = "0.22", optional = true }
 
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "_ring"] }
+rustls-native-certs = "0.8"
+
 [features]
-default = ["mcp"]
 # The MCP server module. Opt-in at run time either way; disable to leave it out of the build.
 mcp = ["dep:base64"]
 

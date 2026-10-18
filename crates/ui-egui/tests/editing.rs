@@ -2666,6 +2666,62 @@ fn editing_existing_text_in_place() {
 }
 
 #[test]
+fn clicking_outside_inline_editor_applies_and_closes() {
+    let mut h = harness(1, |_| {});
+    assert!(h.state_mut().execute("edit.edit_text"));
+    h.run_steps(2);
+    let r = h.state().views[0].page_screen_rect(0).expect("on screen");
+    let at = egui::pos2(r.left() + 40.0 / 200.0 * r.width(), r.top() + (300.0 - 158.0) / 300.0 * r.height());
+    h.hover_at(at);
+    h.run_steps(1);
+    h.drag_at(at);
+    h.run_steps(1);
+    h.drop_at(at);
+    h.run_steps(3);
+    assert!(h.state().views[0].line_editor.is_some(), "editor is open");
+    h.state_mut().views[0].line_editor.as_mut().unwrap().text = "Changed text".into();
+    h.run_steps(2);
+    let blank = egui::pos2(r.left() + 10.0, r.top() + 10.0);
+    h.hover_at(blank);
+    h.run_steps(1);
+    h.drag_at(blank);
+    h.run_steps(1);
+    h.drop_at(blank);
+    h.run_steps(4);
+    assert!(h.state().views[0].line_editor.is_none(), "editor must close on click outside");
+    let s = h.state();
+    let doc = s.session.get(s.views[0].id).unwrap();
+    assert_eq!(doc.text_lines(0)[0].text, "Changed text");
+}
+
+#[test]
+fn clicking_outside_inline_editor_renders_visible_text_on_canvas() {
+    let mut h = harness(1, |_| {});
+    assert!(h.state_mut().execute("edit.edit_text"));
+    h.run_steps(2);
+    let r = h.state().views[0].page_screen_rect(0).expect("on screen");
+    let at = egui::pos2(r.left() + 40.0 / 200.0 * r.width(), r.top() + (300.0 - 158.0) / 300.0 * r.height());
+    h.hover_at(at);
+    h.run_steps(1);
+    h.drag_at(at);
+    h.run_steps(1);
+    h.drop_at(at);
+    h.run_steps(3);
+    assert!(h.state().views[0].line_editor.is_some(), "editor is open");
+    h.state_mut().views[0].line_editor.as_mut().unwrap().text = "Visible After Edit".into();
+    h.run_steps(2);
+    let blank = egui::pos2(r.left() + 10.0, r.top() + 10.0);
+    h.hover_at(blank);
+    h.run_steps(1);
+    h.drag_at(blank);
+    h.run_steps(1);
+    h.drop_at(blank);
+    h.run_steps(4);
+    assert!(h.state().views[0].line_editor.is_none(), "editor must close on click outside");
+    assert_eq!(texts_of(h.state(), 0), ["Visible After\nEdit"], "the text must be rendered and visible in document");
+}
+
+#[test]
 fn text_tool_clicking_source_text_edits_instead_of_adding_a_copy() {
     let mut h = harness(1, |_| {});
     assert!(h.state_mut().execute("edit.text"));
