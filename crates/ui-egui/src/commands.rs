@@ -568,6 +568,28 @@ impl PdfCraftApp {
             }
             "form.detect" => self.detect_fields(),
             "doc.compare" => self.dialog = Some(Dialog::CompareFiles),
+            "ai.panel" | "ai.assistant" => self.choose_right_panel(Some(RightPanel::Ai)),
+            "ai.summary" => {
+                self.choose_right_panel(Some(RightPanel::Ai));
+                if let Some((index, id)) = self.active_ids()
+                    && let Some(doc) = self.session.get(id)
+                {
+                    let view = &self.views[index];
+                    self.ai.trigger_summary(doc, view);
+                }
+            }
+            "ai.ask" => {
+                self.choose_right_panel(Some(RightPanel::Ai));
+            }
+            "ai.redact" => {
+                self.choose_right_panel(Some(RightPanel::Ai));
+                if let Some((index, id)) = self.active_ids()
+                    && let Some(doc) = self.session.get(id)
+                {
+                    let view = &self.views[index];
+                    self.ai.trigger_pii_scan(doc, view);
+                }
+            }
             "standards.pdfa" => {
                 self.pdfa.issues = None;
                 self.dialog = Some(Dialog::PdfA);

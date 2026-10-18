@@ -1966,6 +1966,8 @@ pub struct BlockStyle {
     pub underline: Option<bool>,
     /// Line spacing as a multiple of the font size (1.2 is ordinary).
     pub line_spacing: Option<f64>,
+    /// Space between paragraphs in points (extra vertical space after lines that end a paragraph).
+    pub paragraph_spacing: Option<f64>,
     /// Character spacing (points) and horizontal scaling (percent).
     pub char_spacing: Option<f64>,
     pub scale: Option<f64>,
@@ -2046,6 +2048,7 @@ fn rewrite_block_from(
         && !visual_indic
         && (!style.ranges.is_empty()
             || style.resource.is_some()
+            || style.paragraph_spacing.is_some()
             || (text.is_some_and(|draft| {
                 draft.contains('\n')
                     || pdfcraft_fonts::source_shaping::required(draft)

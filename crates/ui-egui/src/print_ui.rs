@@ -476,7 +476,13 @@ impl PdfCraftApp {
         match result {
             Ok(msg) if msg.is_empty() => self.notify(crate::i18n::fmt(tl!("Sent to {printer}"), &[("printer", printer)])),
             Ok(msg) => self.notify(crate::i18n::fmt(tl!("Sent to {printer}: {msg}"), &[("printer", printer), ("msg", &msg)])),
-            Err(e) => self.notify_error(e),
+            Err(e) => {
+                if e.contains("0x80004002") || e.contains("E_NOINTERFACE") || e.contains("Schnittstelle") {
+                    self.notify_error(format!("{e} — Tip: Select 'Save as PDF' to save and print directly from Windows."));
+                } else {
+                    self.notify_error(e);
+                }
+            }
         }
     }
 

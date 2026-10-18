@@ -29,6 +29,7 @@ macro_rules! tl_ctx {
 }
 
 mod a11y_ui;
+pub mod ai_ui;
 mod actions_ui;
 mod appearance;
 pub mod canvas;
@@ -204,6 +205,8 @@ pub enum RightPanel {
     Search,
     /// Compare files: the differences.
     Compare,
+    /// Sovereign Local AI Assistant.
+    Ai,
 }
 
 /// Quick-action bar tools (the vertical floating strip).
@@ -677,6 +680,7 @@ pub struct PdfCraftApp {
     /// Rules skipped by hand, for the document they were skipped in.
     pub a11y_skipped: std::collections::HashSet<(DocId, pdfcraft_engine::a11y::Rule)>,
     pub alt_draft: a11y_ui::AltDraft,
+    pub ai: ai_ui::AiState,
     /// List the OS key store's signing identities among the digital IDs (the desktop app).
     pub os_key_store_ids: bool,
     pub cert_viewer: Option<sign_ui::CertViewer>,
@@ -998,6 +1002,7 @@ impl PdfCraftApp {
             tags_state: Default::default(),
             a11y_skipped: Default::default(),
             alt_draft: Default::default(),
+            ai: ai_ui::AiState::default(),
             os_key_store_ids: false,
             cert_viewer: None,
             space_audit: Vec::new(),
@@ -2497,6 +2502,7 @@ impl PdfCraftApp {
                     "tags" => Some(RightPanel::Tags),
                     "search" => Some(RightPanel::Search),
                     "compare" => Some(RightPanel::Compare),
+                    "ai" => Some(RightPanel::Ai),
                     "none" => None,
                     other => return Err(format!("unknown panel {other}")),
                 }

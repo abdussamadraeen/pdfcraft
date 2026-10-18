@@ -370,7 +370,7 @@ pub(super) fn rewrite_styled_block(
             metrics.insert(line.font.clone(), Metrics::from_dict(doc, &font));
         }
     }
-    if [style.size, style.line_spacing, style.char_spacing, style.scale, style.width].iter().flatten().any(|v| !v.is_finite())
+    if [style.size, style.line_spacing, style.paragraph_spacing, style.char_spacing, style.scale, style.width].iter().flatten().any(|v| !v.is_finite())
         || style.color.is_some_and(|c| c.iter().any(|v| !v.is_finite()))
     {
         return Err(EditError::Invalid("the paragraph's formatting must use finite numbers".into()));
@@ -565,12 +565,15 @@ pub(super) fn rewrite_styled_block(
     let mut row_start = 0;
     let mut row = Vec::new();
     let mut row_width = 0.0;
+    let mut para_breaks = std::collections::HashSet::new();
     // Wrap at word boundaries, retaining explicit source row breaks and whitespace.
     let mut at = 0;
     while at < chars.len() {
         let Some(item) = chars.get(at) else { break };
         if item.0 == '\n' {
             row_ranges.push(row_start..row_start + row.len());
+            let row_idx = rows.len();
+            para_breaks.insert(row_idx);
             rows.push(std::mem::take(&mut row));
             row_width = 0.0;
             at += 1;
@@ -691,13 +694,14 @@ pub(super) fn rewrite_styled_block(
         .rfind(|v| *v > 0.0)
         .unwrap_or(first.size * 1.5);
     let mut baseline = first.origin.baseline;
+    let mut accumulated_gap = 0.0;
     for (row_index, row) in rows.iter().enumerate() {
         let anchor = block.rows.get(row_index).and_then(|r| r.first()).and_then(|i| lines.get(*i));
         if style.line_spacing.is_none()
             && style.size.is_none()
             && let Some(anchor) = anchor
         {
-            baseline = anchor.origin.baseline;
+            baseline = anchor.origin.baseline - accumulated_gap;
         }
         let anchor = anchor.unwrap_or(first);
         if kept.get(row_index).copied().unwrap_or(false) {
@@ -801,11 +805,18 @@ pub(super) fn rewrite_styled_block(
             x += segment_width;
             pos = end;
         }
-        baseline -= if style.line_spacing.is_none() && style.size.is_none() {
+        let base = if style.line_spacing.is_none() && style.size.is_none() {
             source_leading
         } else {
             style.line_spacing.unwrap_or(1.5).clamp(0.5, 5.0) * style.size.unwrap_or(anchor.size)
         };
+        let extra_p = if para_breaks.contains(&row_index) {
+            style.paragraph_spacing.unwrap_or(0.0).max(0.0)
+        } else {
+            0.0
+        };
+        baseline -= base + extra_p;
+        accumulated_gap += extra_p;
     }
     block_ops.push(Op::new("Q", vec![]));
     let mut drop = coincident_ops(lines, &members);

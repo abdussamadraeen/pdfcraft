@@ -744,3 +744,20 @@ fn imposed_pages_preserve_large_user_unit_matrices() {
         }
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_software_raster_fallback_dry_run() {
+    let doc = fixture(2);
+    let s = Settings { pages: vec![0, 1], ..Settings::default() };
+    let print_pdf: Vec<u8> = match impose(&doc, &s) {
+        Ok(bytes) => bytes,
+        Err(e) => panic!("impose failed: {e}"),
+    };
+
+    let result = spool::windows_software_raster_render(&print_pdf);
+    match result {
+        Ok(count) => assert_eq!(count, 2, "should render 2 sheets"),
+        Err(e) => panic!("dry run fallback failed: {e}"),
+    }
+}

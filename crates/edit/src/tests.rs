@@ -2161,6 +2161,14 @@ fn justify_underline_and_spacing() {
     assert!((lines[0].origin_baseline() - lines[1].origin_baseline() - 20.0).abs() < 0.01);
     let content = String::from_utf8_lossy(&page_content_bytes(&doc, 0)).into_owned();
     assert!(content.contains(" l\nS\n") || content.contains(" l S"), "{content}");
+    // Paragraph spacing adds extra vertical space after lines that end a paragraph.
+    let mut doc = text_page("BT /F1 10 Tf 12 TL 72 700 Td (First line) Tj T* (Second line) Tj ET");
+    let style = text::BlockStyle { line_spacing: Some(1.0), paragraph_spacing: Some(15.0), ..Default::default() };
+    text::rewrite_block(&mut doc, 0, 0, Some("Line One\nLine Two"), &style).unwrap();
+    let lines = text::text_lines(&doc, 0).unwrap();
+    assert_eq!(lines.len(), 2);
+    let drop = lines[0].origin_baseline() - lines[1].origin_baseline();
+    assert!((drop - 25.0).abs() < 0.5, "drop was {drop}, expected 25.0");
     // Character spacing widens, horizontal scale narrows.
     let mut doc = text_page("BT /F1 10 Tf 100 700 Td (Wide text) Tj ET");
     let w0 = text::text_lines(&doc, 0).unwrap()[0].rect;
@@ -2171,6 +2179,31 @@ fn justify_underline_and_spacing() {
     text::rewrite_block(&mut doc, 0, 0, None, &text::BlockStyle { scale: Some(50.0), ..Default::default() }).unwrap();
     let w2 = text::text_lines(&doc, 0).unwrap()[0].rect;
     assert!(((w2[2] - w2[0]) - (w0[2] - w0[0]) / 2.0).abs() < 1.0, "{w0:?} → {w2:?}");
+}
+
+#[test]
+fn paragraph_spacing_without_line_spacing_preserves_source_leading() {
+    let mut doc = text_page("BT /F1 10 Tf 12 TL 72 700 Td (First line) Tj T* (Second line) Tj T* (Third line) Tj ET");
+    let style = text::BlockStyle {
+        paragraph_spacing: Some(15.0),
+        width: Some(100.0),
+        ..Default::default()
+    };
+    text::rewrite_block(&mut doc, 0, 0, Some("First line wraps onto second line\nSecond paragraph"), &style).unwrap();
+    let lines = text::text_lines(&doc, 0).unwrap();
+    assert_eq!(lines.len(), 3, "expected 3 rows (2 in first paragraph, 1 in second): {:?}", lines.iter().map(|l| &l.text).collect::<Vec<_>>());
+    let within_paragraph_gap = lines[0].origin_baseline() - lines[1].origin_baseline();
+    let between_paragraph_gap = lines[1].origin_baseline() - lines[2].origin_baseline();
+    let source_leading = 12.0;
+    assert!(
+        (within_paragraph_gap - source_leading).abs() < 0.1,
+        "within-paragraph gap was {within_paragraph_gap}, expected {source_leading}"
+    );
+    assert!(
+        (between_paragraph_gap - (source_leading + 15.0)).abs() < 0.1,
+        "between-paragraph gap was {between_paragraph_gap}, expected {}",
+        source_leading + 15.0
+    );
 }
 
 #[test]

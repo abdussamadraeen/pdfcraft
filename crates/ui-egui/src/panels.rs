@@ -516,6 +516,7 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     let mut sig_action: Option<crate::sign_ui::PanelAction> = None;
     let mut a11y_action: Option<crate::a11y_ui::PanelAction> = None;
     let mut compare_action: Option<crate::compare_ui::PanelAction> = None;
+    let mut ai_action: Option<crate::ai_ui::AiPanelAction> = None;
     let mut bm_rename = app.bookmark_rename.clone();
     let bm_editable = app.session.get(id).is_some_and(|d| d.allows_assembly() && d.read_only_reason.is_none());
     // Prepare a form is open: the Fields panel orders tabs.
@@ -529,6 +530,7 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
         let a11y = &mut app.a11y;
         let tags_state = &mut app.tags_state;
         let compare = &app.compare;
+        let ai = &mut app.ai;
         let comment_allowed = doc.allows_annotation();
         // A dialog or the palette owns the keyboard: the panel leaves Escape to it.
         let modal = app.dialog.is_some() || app.palette_open;
@@ -549,6 +551,7 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     RightPanel::Tags => ("Tags", None),
                     RightPanel::Search => ("Search", None),
                     RightPanel::Compare => ("Compare", compare.as_ref().filter(|c| c.new == id).map(|c| c.result.changes.len())),
+                    RightPanel::Ai => ("AI Assistant", None),
                 };
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(tl!(title)).font(theme::semibold(15.5)));
@@ -758,6 +761,9 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                             });
                         }
                     }
+                    RightPanel::Ai => {
+                        ai_action = crate::ai_ui::panel_content(ui, &t, ai, doc, view);
+                    }
                 });
             });
     }
@@ -778,6 +784,56 @@ pub fn right_panel(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
     }
     if let Some(a) = compare_action {
         app.compare_action(index, a);
+    }
+    match ai_action {
+        Some(crate::ai_ui::AiPanelAction::GoToPage(p)) => app.views[index].go_to_page(p),
+        Some(crate::ai_ui::AiPanelAction::FlashRect(p, r)) => {
+            let v = &mut app.views[index];
+            v.go_to_page(p);
+            v.flash = Some((p, r, 0.0));
+        }
+        Some(crate::ai_ui::AiPanelAction::ApplyRedaction { page, quads, overlay, reason }) => {
+            let shape = pdfcraft_engine::Shape::Redact { quads, overlay, look: Default::default() };
+            let mut style = pdfcraft_engine::Style::default_for(&shape);
+            style.fill = Some([0.0, 0.0, 0.0]);
+            let author = app.comment_prefs.author.clone();
+            app.apply_edit(pdfcraft_engine::Edit::AddAnnotation(pdfcraft_engine::NewAnnotation {
+                page,
+                shape,
+                style,
+                contents: reason,
+                author,
+            }));
+        }
+        Some(crate::ai_ui::AiPanelAction::ApplyAllRedactions(findings)) => {
+            let author = app.comment_prefs.author.clone();
+            let edits: Vec<pdfcraft_engine::Edit> = findings
+                .into_iter()
+                .map(|(page, quads, overlay, reason)| {
+                    let shape = pdfcraft_engine::Shape::Redact { quads, overlay, look: Default::default() };
+                    let mut style = pdfcraft_engine::Style::default_for(&shape);
+                    style.fill = Some([0.0, 0.0, 0.0]);
+                    pdfcraft_engine::Edit::AddAnnotation(pdfcraft_engine::NewAnnotation {
+                        page,
+                        shape,
+                        style,
+                        contents: reason,
+                        author: author.clone(),
+                    })
+                })
+                .collect();
+            if !edits.is_empty() {
+                let edit = match <[pdfcraft_engine::Edit; 1]>::try_from(edits) {
+                    Ok([one]) => one,
+                    Err(batch) => pdfcraft_engine::Edit::Batch { label: "Apply AI Redactions".into(), edits: batch },
+                };
+                app.apply_edit(edit);
+            }
+        }
+        Some(crate::ai_ui::AiPanelAction::ApplyAltText { figure, alt }) => {
+            app.apply_edit(pdfcraft_engine::Edit::SetAltText { figure, alt: Some(alt) });
+        }
+        None => {}
     }
     match sig_action {
         Some(crate::sign_ui::PanelAction::Validate) => app.run_command("sign.validate"),

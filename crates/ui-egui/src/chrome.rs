@@ -596,6 +596,7 @@ fn main_menu(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
             ui.menu_button(tl!("Display theme"), |ui| theme_menu(app, ui));
             ui.menu_button(tl!("Side panels"), |ui| {
                 for (p, label) in [
+                    (RightPanel::Ai, tl!("AI Assistant")),
                     (RightPanel::Comments, tl!("Comments")),
                     (RightPanel::Bookmarks, tl!("Bookmarks")),
                     (RightPanel::Pages, tl!("Pages")),
@@ -650,6 +651,7 @@ pub fn right_rail(app: &mut PdfCraftApp, ui: &mut egui::Ui) {
                     app.choose_right_panel(if selected { None } else { Some(panel) });
                 }
             };
+            rail_button(ui, RightPanel::Ai, "sparkles", "AI Assistant", false);
             rail_button(ui, RightPanel::Comments, "message-square-text", "Comments", has_comments);
             rail_button(ui, RightPanel::Bookmarks, "bookmark", "Bookmarks", has_outline);
             rail_button(ui, RightPanel::Pages, "files", "Page thumbnails", false);

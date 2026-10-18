@@ -394,7 +394,7 @@ pub fn bm25_score(query_terms: &[String], sentence: &Sentence, all_sentences: &[
 }
 
 /// Jaccard similarity between two sentences based on content words.
-fn jaccard_similarity(a: &Sentence, b: &Sentence) -> f64 {
+pub fn jaccard_similarity(a: &Sentence, b: &Sentence) -> f64 {
     let a_words: HashSet<String> = a.content_words().into_iter().collect();
     let b_words: HashSet<String> = b.content_words().into_iter().collect();
     if a_words.is_empty() && b_words.is_empty() {
@@ -452,6 +452,543 @@ pub fn is_valid_ssn(digits: &str) -> bool {
         return false;
     }
     true
+}
+
+/// TF-ISF (Term Frequency - Inverse Sentence Frequency) vectors and L2 norms.
+pub fn compute_sentence_vectors(
+    sentences: &[Sentence],
+) -> (Vec<BTreeMap<String, f64>>, Vec<f64>) {
+    let n = sentences.len() as f64;
+    let mut sf: BTreeMap<String, usize> = BTreeMap::new();
+    for s in sentences {
+        let unique_words: HashSet<String> = s.content_words().into_iter().collect();
+        for w in unique_words {
+            *sf.entry(w).or_insert(0) += 1;
+        }
+    }
+
+    let mut vectors = Vec::with_capacity(sentences.len());
+    let mut norms = Vec::with_capacity(sentences.len());
+
+    for s in sentences {
+        let words = s.content_words();
+        let mut tf: BTreeMap<String, usize> = BTreeMap::new();
+        for w in &words {
+            *tf.entry(w.clone()).or_insert(0) += 1;
+        }
+
+        let mut vec = BTreeMap::new();
+        let mut norm_sq = 0.0;
+        for (w, count) in tf {
+            let sf_w = *sf.get(&w).unwrap_or(&1) as f64;
+            let isf = ((n + 1.0) / (sf_w + 0.5)).ln() + 1.0;
+            let weight = (count as f64) * isf;
+            norm_sq += weight * weight;
+            vec.insert(w, weight);
+        }
+        let norm = norm_sq.sqrt();
+        vectors.push(vec);
+        norms.push(norm);
+    }
+
+    (vectors, norms)
+}
+
+/// Cosine similarity between two sparse TF-ISF vectors.
+pub fn cosine_similarity(
+    v1: &BTreeMap<String, f64>,
+    norm1: f64,
+    v2: &BTreeMap<String, f64>,
+    norm2: f64,
+) -> f64 {
+    if norm1 <= 1e-9 || norm2 <= 1e-9 {
+        return 0.0;
+    }
+    let mut dot = 0.0;
+    let (small, large) = if v1.len() < v2.len() { (v1, v2) } else { (v2, v1) };
+    for (k, w1) in small {
+        if let Some(w2) = large.get(k) {
+            dot += w1 * w2;
+        }
+    }
+    (dot / (norm1 * norm2)).clamp(0.0, 1.0)
+}
+
+/// TextRank graph centrality via PageRank power iteration over TF-ISF cosine graph.
+pub fn textrank_scores(
+    sentences: &[Sentence],
+    vectors: &[BTreeMap<String, f64>],
+    norms: &[f64],
+) -> Vec<f64> {
+    let n = sentences.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if n == 1 {
+        return vec![1.0];
+    }
+
+    let mut w = vec![vec![0.0f64; n]; n];
+    let mut out_degree = vec![0.0f64; n];
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let sim = cosine_similarity(&vectors[i], norms[i], &vectors[j], norms[j]);
+            if sim > 0.02 {
+                w[i][j] = sim;
+                w[j][i] = sim;
+                out_degree[i] += sim;
+                out_degree[j] += sim;
+            }
+        }
+    }
+
+    let d = 0.85f64;
+    let initial_score = 1.0 / (n as f64);
+    let mut scores = vec![initial_score; n];
+
+    for _ in 0..50 {
+        let mut next_scores = vec![(1.0 - d) / (n as f64); n];
+        let mut dangling_mass = 0.0f64;
+
+        for j in 0..n {
+            if out_degree[j] > 1e-9 {
+                let share = d * scores[j] / out_degree[j];
+                for i in 0..n {
+                    if w[j][i] > 0.0 {
+                        next_scores[i] += share * w[j][i];
+                    }
+                }
+            } else {
+                dangling_mass += scores[j];
+            }
+        }
+
+        if dangling_mass > 0.0 {
+            let uniform_share = d * dangling_mass / (n as f64);
+            for score in &mut next_scores {
+                *score += uniform_share;
+            }
+        }
+
+        let diff: f64 = scores.iter().zip(&next_scores).map(|(a, b)| (a - b).abs()).sum();
+        scores = next_scores;
+        if diff < 1e-4 {
+            break;
+        }
+    }
+
+    scores
+}
+
+/// Select diverse sentences via Maximal Marginal Relevance (MMR).
+pub fn mmr_select(
+    sentences: &[Sentence],
+    scores: &[f64],
+    vectors: &[BTreeMap<String, f64>],
+    norms: &[f64],
+    limit: usize,
+    lambda: f64,
+) -> Vec<usize> {
+    if sentences.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let max_score = scores.iter().copied().fold(1e-9f64, f64::max);
+    let mut selected: Vec<usize> = Vec::with_capacity(limit);
+    let mut remaining: HashSet<usize> = (0..sentences.len()).collect();
+
+    while selected.len() < limit && !remaining.is_empty() {
+        let mut best_idx = None;
+        let mut best_mmr = f64::NEG_INFINITY;
+
+        for &i in &remaining {
+            let norm_score = scores[i] / max_score;
+            let max_sim = selected
+                .iter()
+                .map(|&sel| cosine_similarity(&vectors[i], norms[i], &vectors[sel], norms[sel]))
+                .fold(0.0f64, f64::max);
+
+            let mmr = lambda * norm_score - (1.0 - lambda) * max_sim;
+            if mmr > best_mmr {
+                best_mmr = mmr;
+                best_idx = Some(i);
+            }
+        }
+
+        if let Some(chosen) = best_idx {
+            remaining.remove(&chosen);
+            selected.push(chosen);
+        } else {
+            break;
+        }
+    }
+
+    selected
+}
+
+/// Pure extractive summarization logic on a collection of sentences using
+/// TextRank (PageRank power iteration over TF-ISF cosine graph) and Maximal
+/// Marginal Relevance (MMR) for optimal information density without repetition.
+pub fn generate_summary_pure(
+    all_sentences: &[Sentence],
+    max_points: usize,
+    length_pref: &str,
+) -> (String, Vec<(usize, String)>, usize, usize) {
+    if all_sentences.is_empty() {
+        return ("The document contains no readable text to summarize.".into(), Vec::new(), 0, 0);
+    }
+
+    let mut total_words: usize = 0;
+    for s in all_sentences {
+        total_words = total_words.saturating_add(s.words().len());
+    }
+
+    // 1. Build TF-ISF sentence vectors and L2 norms
+    let (vectors, norms) = compute_sentence_vectors(all_sentences);
+
+    // 2. Compute TextRank graph centrality
+    let tr_scores = textrank_scores(all_sentences, &vectors, &norms);
+
+    // 3. Apply position bias & length normalization
+    let combined_scores: Vec<f64> = all_sentences
+        .iter()
+        .zip(&tr_scores)
+        .map(|(s, &tr)| {
+            let mut score = tr;
+            let word_count = s.words().len();
+
+            // Structural document bias
+            if s.index_on_page == 0 {
+                score *= if s.page == 1 { 1.45 } else { 1.25 };
+            }
+
+            // Ideal informational sentence length window (10 to 45 words)
+            if (10..=45).contains(&word_count) {
+                score *= 1.2;
+            } else if !(5..=65).contains(&word_count) {
+                score *= 0.65;
+            }
+
+            score
+        })
+        .collect();
+
+    // 4. Maximal Marginal Relevance selection (lambda = 0.72)
+    let selected_indices = mmr_select(all_sentences, &combined_scores, &vectors, &norms, max_points.max(3), 0.72);
+
+    let selected_sentences: Vec<&Sentence> = selected_indices.iter().filter_map(|&i| all_sentences.get(i)).collect();
+
+    let summary_count = match length_pref {
+        "short" => 1,
+        "detailed" => 3.min(selected_sentences.len()),
+        _ => 2.min(selected_sentences.len()),
+    };
+
+    // Synthesize structured executive overview
+    let lead_sentences: Vec<String> = selected_sentences
+        .iter()
+        .take(summary_count)
+        .map(|s| format!("{} [Page {}]", s.text.trim_end_matches('.'), s.page))
+        .collect();
+
+    let summary_text = lead_sentences.join(". ") + ".";
+
+    let key_points: Vec<(usize, String)> = selected_sentences
+        .into_iter()
+        .map(|s| (s.page, s.text.clone()))
+        .collect();
+
+    let reading_time = ((total_words as f64) / 200.0).ceil() as usize;
+
+    (summary_text, key_points, total_words, reading_time.max(1))
+}
+
+/// Pure BM25 question answering search over sentences.
+pub fn search_answer_pure(
+    question: &str,
+    all_sentences: &[Sentence],
+    max_citations: usize,
+) -> (String, &'static str, Vec<(usize, String, f64)>) {
+    if all_sentences.is_empty() {
+        return ("The document contains no readable text to answer this question.".into(), "low", Vec::new());
+    }
+
+    let mut total_words: usize = 0;
+    for s in all_sentences {
+        total_words = total_words.saturating_add(s.words().len());
+    }
+
+    let avg_len = (total_words as f64) / (all_sentences.len() as f64).max(1.0);
+    let q_words = tokenize_words(question);
+    let stop_set: HashSet<&str> = STOP_WORDS.iter().copied().collect();
+    let q_content: Vec<String> = q_words.into_iter().filter(|w| !stop_set.contains(w.as_str())).collect();
+    let query_terms = if q_content.is_empty() { tokenize_words(question) } else { q_content };
+
+    let mut scored_sentences: Vec<(f64, &Sentence)> =
+        all_sentences.iter().map(|s| (bm25_score(&query_terms, s, all_sentences, avg_len), s)).filter(|(score, _)| *score > 0.05).collect();
+
+    scored_sentences.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    if scored_sentences.is_empty() {
+        return (format!("No direct matches or relevant sections found in the document answering '{question}'."), "low", Vec::new());
+    }
+
+    let top_matches: Vec<_> = scored_sentences.iter().take(max_citations).collect();
+    let citations: Vec<(usize, String, f64)> = top_matches
+        .iter()
+        .map(|(score, s)| (s.page, s.text.clone(), (((score * 100.0).round()) / 100.0)))
+        .collect();
+
+    let top_match = top_matches[0].1;
+    let best_score = top_matches[0].0;
+    let confidence = if best_score >= 1.5 { "high" } else { "medium" };
+
+    let answer = if top_matches.len() == 1 {
+        format!("According to [Page {}], {}.", top_match.page, top_match.text.trim_end_matches('.'))
+    } else {
+        let primary = format!("{}. [Page {}]", top_match.text.trim_end_matches('.'), top_match.page);
+        let secondary = format!("{}. [Page {}]", top_matches[1].1.text.trim_end_matches('.'), top_matches[1].1.page);
+        format!("{primary} Additionally, {secondary}")
+    };
+
+    (answer, confidence, citations)
+}
+
+/// A detected sensitive entity finding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Finding {
+    pub page: usize,
+    pub category: &'static str,
+    pub text: String,
+    pub reason: &'static str,
+    pub quads: Vec<[f64; 8]>,
+    pub rect: [f32; 4],
+}
+
+/// Options controlling which categories to scan for in `scan_sensitive_findings`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanOptions {
+    pub email: bool,
+    pub ssn: bool,
+    pub card: bool,
+    pub phone: bool,
+    pub key: bool,
+    pub ip: bool,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            email: true,
+            ssn: true,
+            card: true,
+            phone: true,
+            key: true,
+            ip: true,
+        }
+    }
+}
+
+/// Detect sensitive PII entities (SSN, credit card, email, phone, API keys, IP addresses).
+pub fn scan_sensitive_findings(
+    pages: &[usize],
+    texts: &[std::sync::Arc<pdfcraft_render::PageText>],
+    info: &pdfcraft_render::DocInfo,
+    options: ScanOptions,
+) -> Vec<Finding> {
+    let mut findings: Vec<Finding> = Vec::new();
+
+    for (&p, text) in pages.iter().zip(texts) {
+        let plain = text.plain_text();
+
+        // 1. Emails
+        if options.email {
+            for token in plain.split_whitespace() {
+                let cleaned = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '.' && c != '_' && c != '-');
+                if let Some(at_idx) = cleaned.find('@') {
+                    let user = &cleaned[..at_idx];
+                    let domain = &cleaned[at_idx + 1..];
+                    if !user.is_empty() && domain.contains('.') && domain.len() >= 3 {
+                        let hits = text.find_opts(cleaned, false, true);
+                        for h in hits {
+                            let rects = text.line_rects(h);
+                            if let Some(&first_rect) = rects.first() {
+                                let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
+                                findings.push(Finding {
+                                    page: p,
+                                    category: "email",
+                                    text: cleaned.to_string(),
+                                    reason: "Direct email address identifier",
+                                    quads,
+                                    rect: first_rect,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. SSN: ddd-dd-dddd
+        if options.ssn {
+            let chars: Vec<char> = plain.chars().collect();
+            for i in 0..chars.len().saturating_sub(10) {
+                if chars[i].is_ascii_digit()
+                    && chars[i + 1].is_ascii_digit()
+                    && chars[i + 2].is_ascii_digit()
+                    && chars[i + 3] == '-'
+                    && chars[i + 4].is_ascii_digit()
+                    && chars[i + 5].is_ascii_digit()
+                    && chars[i + 6] == '-'
+                    && chars[i + 7].is_ascii_digit()
+                    && chars[i + 8].is_ascii_digit()
+                    && chars[i + 9].is_ascii_digit()
+                    && chars[i + 10].is_ascii_digit()
+                {
+                    let snippet: String = chars[i..=i + 10].iter().collect();
+                    let raw_digits: String = snippet.chars().filter(|c| c.is_ascii_digit()).collect();
+                    if is_valid_ssn(&raw_digits) {
+                        let hits = text.find_opts(&snippet, false, true);
+                        for h in hits {
+                            let rects = text.line_rects(h);
+                            if let Some(&first_rect) = rects.first() {
+                                let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
+                                findings.push(Finding {
+                                    page: p,
+                                    category: "ssn",
+                                    text: snippet.clone(),
+                                    reason: "Social Security Number format",
+                                    quads,
+                                    rect: first_rect,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Credit Cards (Luhn verified)
+        if options.card {
+            for token in plain.split_whitespace() {
+                let cleaned: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
+                if (13..=19).contains(&cleaned.len()) {
+                    let digits: Vec<u8> = cleaned.bytes().map(|b| b.saturating_sub(b'0')).collect();
+                    if luhn_check(&digits) {
+                        let hits = text.find_opts(token.trim_matches(|c: char| !c.is_ascii_digit()), false, false);
+                        for h in hits {
+                            let rects = text.line_rects(h);
+                            if let Some(&first_rect) = rects.first() {
+                                let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
+                                findings.push(Finding {
+                                    page: p,
+                                    category: "credit_card",
+                                    text: token.to_string(),
+                                    reason: "Payment card number matching Luhn verification",
+                                    quads,
+                                    rect: first_rect,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Phone numbers
+        if options.phone {
+            let chars: Vec<char> = plain.chars().collect();
+            for i in 0..chars.len().saturating_sub(11) {
+                if chars[i].is_ascii_digit()
+                    && chars[i + 1].is_ascii_digit()
+                    && chars[i + 2].is_ascii_digit()
+                    && (chars[i + 3] == '-' || chars[i + 3] == '.')
+                    && chars[i + 4].is_ascii_digit()
+                    && chars[i + 5].is_ascii_digit()
+                    && chars[i + 6].is_ascii_digit()
+                    && (chars[i + 7] == '-' || chars[i + 7] == '.')
+                    && chars[i + 8].is_ascii_digit()
+                    && chars[i + 9].is_ascii_digit()
+                    && chars[i + 10].is_ascii_digit()
+                    && chars[i + 11].is_ascii_digit()
+                {
+                    let snippet: String = chars[i..=i + 11].iter().collect();
+                    let hits = text.find_opts(&snippet, false, true);
+                    for h in hits {
+                        let rects = text.line_rects(h);
+                        if let Some(&first_rect) = rects.first() {
+                            let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
+                            findings.push(Finding {
+                                page: p,
+                                category: "phone",
+                                text: snippet.clone(),
+                                reason: "Telephone contact number",
+                                quads,
+                                rect: first_rect,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. API keys and passwords
+        if options.key {
+            for token in plain.split_whitespace() {
+                let is_key = token.starts_with("sk_live_")
+                    || token.starts_with("ghp_")
+                    || (token.starts_with("AKIA") && token.len() == 20)
+                    || token.to_lowercase().starts_with("bearer");
+                if is_key {
+                    let hits = text.find_opts(token, false, true);
+                    for h in hits {
+                        let rects = text.line_rects(h);
+                        if let Some(&first_rect) = rects.first() {
+                            let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
+                            findings.push(Finding {
+                                page: p,
+                                category: "api_key",
+                                text: token.to_string(),
+                                reason: "API secret key or credential token",
+                                quads,
+                                rect: first_rect,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. IPv4 Addresses
+        if options.ip {
+            for token in plain.split_whitespace() {
+                let cleaned = token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+                let parts: Vec<&str> = cleaned.split('.').collect();
+                if parts.len() == 4 && parts.iter().all(|part| part.parse::<u8>().is_ok() && (part.len() == 1 || !part.starts_with('0'))) {
+                    let hits = text.find_opts(cleaned, false, true);
+                    for h in hits {
+                        let rects = text.line_rects(h);
+                        if let Some(&first_rect) = rects.first() {
+                            let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
+                            findings.push(Finding {
+                                page: p,
+                                category: "ip_address",
+                                text: cleaned.to_string(),
+                                reason: "IPv4 network address",
+                                quads,
+                                rect: first_rect,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Deduplicate findings by page and text
+    let mut seen = HashSet::new();
+    findings.retain(|f| seen.insert((f.page, f.text.clone())));
+    findings
 }
 
 impl Automation {
@@ -533,100 +1070,26 @@ impl Automation {
             }));
         }
 
-        // Global term frequency calculation (content words)
-        let mut term_freq: BTreeMap<String, usize> = BTreeMap::new();
-        for s in &all_sentences {
-            for w in s.content_words() {
-                *term_freq.entry(w).or_insert(0) += 1;
-            }
-        }
+        let (summary_text, key_points_raw, total_words, reading_time) =
+            generate_summary_pure(&all_sentences, max_points, length_pref);
 
-        // Score sentences by term significance + position bias
-        let mut scored_sentences: Vec<(f64, Sentence)> = all_sentences
-            .iter()
-            .map(|s| {
-                let words = s.content_words();
-                let word_count = s.words().len();
-                let mut score = 0.0;
-                for w in &words {
-                    score += *term_freq.get(w).unwrap_or(&0) as f64;
-                }
-
-                // Normalise by length dampener (penalise extreme short/long)
-                if word_count > 0 {
-                    score /= (word_count as f64).powf(0.55).max(1.0);
-                }
-
-                // Lead sentence boost
-                if s.index_on_page == 0 {
-                    score *= if s.page == 1 { 1.5 } else { 1.25 };
-                }
-
-                // Appropriate sentence length sweet spot (10..40 words)
-                if (10..=40).contains(&word_count) {
-                    score *= 1.2;
-                } else if !(5..=60).contains(&word_count) {
-                    score *= 0.6;
-                }
-
-                (score, s.clone())
-            })
-            .collect();
-
-        scored_sentences.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Select diverse key points via Maximal Marginal Relevance (MMR)
-        let mut selected_points: Vec<Sentence> = Vec::new();
-        for (_score, s) in &scored_sentences {
-            if selected_points.len() >= max_points {
-                break;
-            }
-            let is_redundant = selected_points.iter().any(|existing| jaccard_similarity(existing, s) > 0.38);
-            if !is_redundant {
-                selected_points.push(s.clone());
-            }
-        }
-
-        // Fallback if diversity filtered too aggressively
-        if selected_points.is_empty() && !scored_sentences.is_empty() {
-            selected_points.push(scored_sentences[0].1.clone());
-        }
-
-        // Format key points with explicit page citations
-        let key_points: Vec<Value> = selected_points
-            .iter()
-            .map(|s| {
+        let cited_pages: BTreeSet<usize> = key_points_raw.iter().map(|(p, _)| *p).collect();
+        let key_points: Vec<Value> = key_points_raw
+            .into_iter()
+            .map(|(p, text)| {
                 json!({
-                    "page": s.page,
-                    "citation": format!("[Page {}]", s.page),
-                    "text": s.text,
+                    "page": p,
+                    "citation": format!("[Page {p}]"),
+                    "text": text,
                 })
             })
             .collect();
-
-        // Formulate executive summary
-        let summary_sentences_count = match length_pref {
-            "short" => 1,
-            "detailed" => 3.min(selected_points.len()),
-            _ => 2.min(selected_points.len()),
-        };
-
-        let summary_text: String = selected_points
-            .iter()
-            .take(summary_sentences_count)
-            .map(|s| format!("{} [Page {}]", s.text.trim_end_matches('.'), s.page))
-            .collect::<Vec<String>>()
-            .join(". ")
-            + ".";
-
-        let cited_pages: BTreeSet<usize> = selected_points.iter().map(|s| s.page).collect();
-        let reading_time = ((total_words as f64) / 200.0).ceil() as usize;
 
         Ok(json!({
             "summary": summary_text,
             "key_points": key_points,
             "word_count": total_words,
-            "reading_time_minutes": reading_time.max(1),
+            "reading_time_minutes": reading_time,
             "page_count": pages.len(),
             "citations": cited_pages.into_iter().collect::<Vec<_>>(),
         }))
@@ -664,60 +1127,18 @@ impl Automation {
             all_sentences.extend(page_sentences);
         }
 
-        if all_sentences.is_empty() {
-            return Ok(json!({
-                "question": question,
-                "answer": "The document contains no readable text to answer this question.",
-                "confidence": "low",
-                "citations": [],
-            }));
-        }
+        let (answer, confidence, citations_raw) = search_answer_pure(question, &all_sentences, max_citations);
 
-        let avg_len = (total_words as f64) / (all_sentences.len() as f64).max(1.0);
-        let q_words = tokenize_words(question);
-        let stop_set: HashSet<&str> = STOP_WORDS.iter().copied().collect();
-        let q_content: Vec<String> = q_words.into_iter().filter(|w| !stop_set.contains(w.as_str())).collect();
-        let query_terms = if q_content.is_empty() { tokenize_words(question) } else { q_content };
-
-        // BM25 relevance scoring
-        let mut scored_sentences: Vec<(f64, &Sentence)> =
-            all_sentences.iter().map(|s| (bm25_score(&query_terms, s, &all_sentences, avg_len), s)).filter(|(score, _)| *score > 0.05).collect();
-
-        scored_sentences.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        if scored_sentences.is_empty() {
-            return Ok(json!({
-                "question": question,
-                "answer": format!("No direct matches or relevant sections found in the document answering '{question}'."),
-                "confidence": "low",
-                "citations": [],
-            }));
-        }
-
-        let top_matches: Vec<_> = scored_sentences.iter().take(max_citations).collect();
-        let citations: Vec<Value> = top_matches
-            .iter()
-            .map(|(score, s)| {
+        let citations: Vec<Value> = citations_raw
+            .into_iter()
+            .map(|(page, excerpt, score)| {
                 json!({
-                    "page": s.page,
-                    "excerpt": s.text,
-                    "score": ((score * 100.0).round()) / 100.0,
+                    "page": page,
+                    "excerpt": excerpt,
+                    "score": score,
                 })
             })
             .collect();
-
-        // Synthesize coherent grounded answer
-        let top_match = top_matches[0].1;
-        let best_score = top_matches[0].0;
-        let confidence = if best_score >= 1.5 { "high" } else { "medium" };
-
-        let answer = if top_matches.len() == 1 {
-            format!("According to [Page {}], {}.", top_match.page, top_match.text.trim_end_matches('.'))
-        } else {
-            let primary = format!("{}. [Page {}]", top_match.text.trim_end_matches('.'), top_match.page);
-            let secondary = format!("{}. [Page {}]", top_matches[1].1.text.trim_end_matches('.'), top_matches[1].1.page);
-            format!("{primary} Additionally, {secondary}")
-        };
 
         Ok(json!({
             "question": question,
@@ -756,207 +1177,15 @@ impl Automation {
         let texts = self.page_texts(id, &pages)?;
         let info = self.doc(a)?.info.clone();
 
-        struct Finding {
-            page: usize,
-            category: &'static str,
-            text: String,
-            reason: &'static str,
-            quads: Vec<[f64; 8]>,
-            rect: [f32; 4],
-        }
-
-        let mut findings: Vec<Finding> = Vec::new();
-
-        for (&p, text) in pages.iter().zip(&texts) {
-            let plain = text.plain_text();
-
-            // 1. Emails
-            if want_email {
-                for token in plain.split_whitespace() {
-                    let cleaned = token.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '.' && c != '_' && c != '-');
-                    if let Some(at_idx) = cleaned.find('@') {
-                        let user = &cleaned[..at_idx];
-                        let domain = &cleaned[at_idx + 1..];
-                        if !user.is_empty() && domain.contains('.') && domain.len() >= 3 {
-                            let hits = text.find_opts(cleaned, false, true);
-                            for h in hits {
-                                let rects = text.line_rects(h);
-                                if let Some(&first_rect) = rects.first() {
-                                    let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
-                                    findings.push(Finding {
-                                        page: p,
-                                        category: "email",
-                                        text: cleaned.to_string(),
-                                        reason: "Direct email address identifier",
-                                        quads,
-                                        rect: first_rect,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 2. SSN: ddd-dd-dddd
-            if want_ssn {
-                let chars: Vec<char> = plain.chars().collect();
-                for i in 0..chars.len().saturating_sub(10) {
-                    if chars[i].is_ascii_digit()
-                        && chars[i + 1].is_ascii_digit()
-                        && chars[i + 2].is_ascii_digit()
-                        && chars[i + 3] == '-'
-                        && chars[i + 4].is_ascii_digit()
-                        && chars[i + 5].is_ascii_digit()
-                        && chars[i + 6] == '-'
-                        && chars[i + 7].is_ascii_digit()
-                        && chars[i + 8].is_ascii_digit()
-                        && chars[i + 9].is_ascii_digit()
-                        && chars[i + 10].is_ascii_digit()
-                    {
-                        let snippet: String = chars[i..=i + 10].iter().collect();
-                        let raw_digits: String = snippet.chars().filter(|c| c.is_ascii_digit()).collect();
-                        if is_valid_ssn(&raw_digits) {
-                            let hits = text.find_opts(&snippet, false, true);
-                            for h in hits {
-                                let rects = text.line_rects(h);
-                                if let Some(&first_rect) = rects.first() {
-                                    let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
-                                    findings.push(Finding {
-                                        page: p,
-                                        category: "ssn",
-                                        text: snippet.clone(),
-                                        reason: "Social Security Number format",
-                                        quads,
-                                        rect: first_rect,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 3. Credit Cards (Luhn verified)
-            if want_card {
-                for token in plain.split_whitespace() {
-                    let cleaned: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
-                    if (13..=19).contains(&cleaned.len()) {
-                        let digits: Vec<u8> = cleaned.bytes().map(|b| b.saturating_sub(b'0')).collect();
-                        if luhn_check(&digits) {
-                            let hits = text.find_opts(token.trim_matches(|c: char| !c.is_ascii_digit()), false, false);
-                            for h in hits {
-                                let rects = text.line_rects(h);
-                                if let Some(&first_rect) = rects.first() {
-                                    let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
-                                    findings.push(Finding {
-                                        page: p,
-                                        category: "credit_card",
-                                        text: token.to_string(),
-                                        reason: "Payment card number matching Luhn verification",
-                                        quads,
-                                        rect: first_rect,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 4. Phone numbers: e.g. (555) 123-4567 or 555-123-4567
-            if want_phone {
-                let chars: Vec<char> = plain.chars().collect();
-                for i in 0..chars.len().saturating_sub(11) {
-                    if chars[i].is_ascii_digit()
-                        && chars[i + 1].is_ascii_digit()
-                        && chars[i + 2].is_ascii_digit()
-                        && (chars[i + 3] == '-' || chars[i + 3] == '.')
-                        && chars[i + 4].is_ascii_digit()
-                        && chars[i + 5].is_ascii_digit()
-                        && chars[i + 6].is_ascii_digit()
-                        && (chars[i + 7] == '-' || chars[i + 7] == '.')
-                        && chars[i + 8].is_ascii_digit()
-                        && chars[i + 9].is_ascii_digit()
-                        && chars[i + 10].is_ascii_digit()
-                        && chars[i + 11].is_ascii_digit()
-                    {
-                        let snippet: String = chars[i..=i + 11].iter().collect();
-                        let hits = text.find_opts(&snippet, false, true);
-                        for h in hits {
-                            let rects = text.line_rects(h);
-                            if let Some(&first_rect) = rects.first() {
-                                let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
-                                findings.push(Finding {
-                                    page: p,
-                                    category: "phone",
-                                    text: snippet.clone(),
-                                    reason: "Telephone contact number",
-                                    quads,
-                                    rect: first_rect,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 5. API keys and passwords
-            if want_key {
-                for token in plain.split_whitespace() {
-                    let is_key = token.starts_with("sk_live_")
-                        || token.starts_with("ghp_")
-                        || (token.starts_with("AKIA") && token.len() == 20)
-                        || token.to_lowercase().starts_with("bearer");
-                    if is_key {
-                        let hits = text.find_opts(token, false, true);
-                        for h in hits {
-                            let rects = text.line_rects(h);
-                            if let Some(&first_rect) = rects.first() {
-                                let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
-                                findings.push(Finding {
-                                    page: p,
-                                    category: "api_key",
-                                    text: token.to_string(),
-                                    reason: "API secret key or credential token",
-                                    quads,
-                                    rect: first_rect,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 6. IPv4 Addresses
-            if want_ip {
-                for token in plain.split_whitespace() {
-                    let cleaned = token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
-                    let parts: Vec<&str> = cleaned.split('.').collect();
-                    if parts.len() == 4 && parts.iter().all(|part| part.parse::<u8>().is_ok() && (part.len() == 1 || !part.starts_with('0'))) {
-                        let hits = text.find_opts(cleaned, false, true);
-                        for h in hits {
-                            let rects = text.line_rects(h);
-                            if let Some(&first_rect) = rects.first() {
-                                let quads: Vec<[f64; 8]> = rects.iter().map(|r| info.pages[p].view_rect_to_quad(*r)).collect();
-                                findings.push(Finding {
-                                    page: p,
-                                    category: "ip_address",
-                                    text: cleaned.to_string(),
-                                    reason: "IPv4 network address",
-                                    quads,
-                                    rect: first_rect,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Deduplicate findings by page and text
-        let mut seen = HashSet::new();
-        findings.retain(|f| seen.insert((f.page, f.text.clone())));
+        let options = ScanOptions {
+            email: want_email,
+            ssn: want_ssn,
+            card: want_card,
+            phone: want_phone,
+            key: want_key,
+            ip: want_ip,
+        };
+        let findings = scan_sensitive_findings(&pages, &texts, &info, options);
 
         let mark = a.opt_bool("mark")?.unwrap_or(false);
         let mut marked_count = 0;
@@ -1149,3 +1378,42 @@ impl Automation {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn textrank_and_mmr_select_salient_and_diverse_sentences() {
+        let text = "Artificial intelligence accelerates medical diagnosis. \
+Artificial intelligence algorithms analyze complex medical scans. \
+Deep learning neural networks improve healthcare outcomes. \
+Space exploration missions are launching robotic rovers to Mars. \
+Robotic rovers explore Mars searching for ancient Martian soil samples.";
+
+        let sentences = split_sentences(text, 1);
+        assert_eq!(sentences.len(), 5);
+
+        let (vectors, norms) = compute_sentence_vectors(&sentences);
+        let tr_scores = textrank_scores(&sentences, &vectors, &norms);
+        assert_eq!(tr_scores.len(), 5);
+
+        for &score in &tr_scores {
+            assert!(score.is_finite() && score > 0.0);
+        }
+
+        let selected = mmr_select(&sentences, &tr_scores, &vectors, &norms, 2, 0.55);
+        assert_eq!(selected.len(), 2);
+
+        let cluster_ai = selected.iter().any(|&i| i < 3);
+        let cluster_mars = selected.iter().any(|&i| i >= 3);
+        assert!(cluster_ai && cluster_mars, "MMR must select diverse topics: {:?}", selected);
+
+        let (summary, key_points, words, reading_time) = generate_summary_pure(&sentences, 3, "medium");
+        assert!(!summary.is_empty());
+        assert!(!key_points.is_empty());
+        assert!(words > 20);
+        assert!(reading_time >= 1);
+    }
+}
+

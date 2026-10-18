@@ -14,3 +14,9 @@ pdfcraft-cos = { workspace = true }
 pdfcraft-content = { workspace = true }
 pdfcraft-model = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+pdfcraft-render = { workspace = true }
+png = "0.18"
+tempfile = "3"
+log = { workspace = true }
